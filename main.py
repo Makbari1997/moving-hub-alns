@@ -1,0 +1,2137 @@
+import random
+
+from typing import List, Dict, Tuple, Optional
+import json
+from copy import deepcopy
+import time
+import pandas as pd
+
+
+# OR-Tools imports
+try:
+    from ortools.constraint_solver import routing_enums_pb2
+    from ortools.constraint_solver import pywrapcp
+
+    ORTOOLS_AVAILABLE = True
+except ImportError:
+    print(
+        "Warning: OR-Tools not available. Route optimization will use fallback methods."
+    )
+    ORTOOLS_AVAILABLE = False
+
+from visualize import *
+from preprocessing import *
+from data_structures import *
+from distance_calculator import *
+
+
+class ALNSSolver:
+    """Main ALNS solver with OR-Tools integration"""
+
+    def __init__(self, config: ProblemConfig):
+        self.config = config
+        self.constructor = ConstructionHeuristic(config)
+        self.operators = ALNSOperators(config)
+        self.random = random.Random(42)
+
+    def solve(
+        self,
+        pickup_terminals: List[PickupTerminal],
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+        max_iterations: int = 1000,
+    ) -> Solution:
+        """Solve the VRP using ALNS with comprehensive vehicle optimization and OR-Tools"""
+        start_time = time.time()
+
+        # Generate initial solution
+        print("Generating initial solution with OR-Tools optimization...")
+        current_solution = self.constructor.greedy_construction(
+            pickup_terminals, distance_matrix, eta_matrix
+        )
+
+        # Apply initial vehicle optimization
+        print("Optimizing initial vehicle assignments...")
+        current_solution = self.operators.vehicle_consolidation_operator(
+            current_solution, distance_matrix, eta_matrix
+        )
+
+        best_solution = deepcopy(current_solution)
+
+        print(
+            f"Initial solution: {len(current_solution.routes)} routes, "
+            f"cost: {current_solution.total_cost:.2f}, "
+            f"duration: {current_solution.total_duration/3600:.2f}h, "
+            f"feasible: {current_solution.is_feasible}"
+        )
+
+        # Print vehicle type distribution
+        vehicle_counts = {}
+        optimized_routes = 0
+        for route in current_solution.routes:
+            vtype = route.vehicle_type.value
+            vehicle_counts[vtype] = vehicle_counts.get(vtype, 0) + 1
+            if route.is_optimized:
+                optimized_routes += 1
+
+        print(f"Vehicle distribution: {vehicle_counts}")
+        print(
+            f"OR-Tools optimized routes: {optimized_routes}/{len(current_solution.routes)}"
+        )
+
+        if not current_solution.is_feasible:
+            print(f"Warning: Initial solution is not feasible!")
+            print(f"  - Unassigned parcels: {len(current_solution.unassigned_parcels)}")
+            time_violations = [
+                r
+                for r in current_solution.routes
+                if not r.is_time_feasible(self.config.time_window_seconds)
+            ]
+            print(f"  - Time window violations: {len(time_violations)}")
+
+        # ALNS main loop with vehicle optimization and OR-Tools
+        vehicle_optimization_frequency = (
+            50  # Apply vehicle optimization every N iterations
+        )
+
+        for iteration in range(max_iterations):
+            # Choose operator type
+            operator_choice = self.random.random()
+
+            if operator_choice < 0.25:
+                # Standard destroy-repair
+                if self.random.random() < 0.5:
+                    print("Destroy Operator: random_removal")
+                    destroyed = self.operators.random_removal(current_solution)
+                else:
+                    print("Destroy Operator: terminal_removal")
+                    destroyed = self.operators.terminal_removal(current_solution)
+                print("Repair Operator: greedy_insertion")
+                repaired = self.operators.greedy_insertion(
+                    destroyed, distance_matrix, eta_matrix
+                )
+
+            elif operator_choice < 0.5:
+                # Vehicle type optimization
+                if self.random.random() < 0.4:
+                    print("Optimizing Vehicle Type: vehicle_consolidation_operator")
+                    repaired = self.operators.vehicle_consolidation_operator(
+                        current_solution, distance_matrix, eta_matrix
+                    )
+                elif self.random.random() < 0.7:
+                    print("Optimizing Vehicle Type: vehicle_type_swap_operator")
+                    repaired = self.operators.vehicle_type_swap_operator(
+                        current_solution, distance_matrix, eta_matrix
+                    )
+                else:
+                    repaired = self.operators.route_splitting_operator(
+                        current_solution, distance_matrix, eta_matrix
+                    )
+            else:
+                # Combined destroy-repair + vehicle optimization
+                if self.random.random() < 0.5:
+                    destroyed = self.operators.random_removal(current_solution)
+                else:
+                    destroyed = self.operators.terminal_removal(current_solution)
+
+                repaired = self.operators.greedy_insertion(
+                    destroyed, distance_matrix, eta_matrix
+                )
+                repaired = self.operators.vehicle_consolidation_operator(
+                    repaired, distance_matrix, eta_matrix
+                )
+
+            # Evaluate solution
+            repaired.calculate_cost_and_time(distance_matrix, eta_matrix)
+            repaired.is_feasible = (
+                len(repaired.unassigned_parcels) == 0
+                and repaired.validate_knock_constraints(self.config.max_knock)
+                and repaired.validate_time_window(self.config.time_window_seconds)
+            )
+
+            # Acceptance criterion with vehicle optimization awareness
+            accept_solution = False
+
+            if repaired.is_feasible:
+                if (
+                    not best_solution.is_feasible
+                    or repaired.total_cost < best_solution.total_cost
+                ):
+                    best_solution = deepcopy(repaired)
+                    current_solution = repaired
+                    accept_solution = True
+
+                    # Print improvement details
+                    vehicle_counts = {}
+                    optimized_routes = 0
+                    for route in best_solution.routes:
+                        vtype = route.vehicle_type.value
+                        vehicle_counts[vtype] = vehicle_counts.get(vtype, 0) + 1
+                        if route.is_optimized:
+                            optimized_routes += 1
+
+                    print(
+                        f"Iteration {iteration}: New best solution - "
+                        f"cost: {best_solution.total_cost:.2f}, "
+                        f"vehicles: {vehicle_counts}, "
+                        f"optimized: {optimized_routes}/{len(best_solution.routes)}, "
+                        f"duration: {best_solution.total_duration/3600:.2f}h"
+                    )
+
+                elif (
+                    repaired.total_cost < current_solution.total_cost * 1.05
+                ):  # Accept slightly worse
+                    current_solution = repaired
+                    accept_solution = True
+            else:
+                # Accept infeasible solutions occasionally to escape local optima
+                if self.random.random() < 0.05:
+                    current_solution = repaired
+                    accept_solution = True
+
+            # Periodic vehicle optimization for diversification
+            if iteration > 0 and iteration % vehicle_optimization_frequency == 0:
+                if best_solution.is_feasible:
+                    current_solution = self.operators.vehicle_consolidation_operator(
+                        deepcopy(best_solution), distance_matrix, eta_matrix
+                    )
+                    print(f"Iteration {iteration}: Applied vehicle optimization")
+
+        processing_time = time.time() - start_time
+        print(f"Solved in {processing_time:.2f} seconds")
+
+        # Final vehicle optimization
+        if best_solution.is_feasible:
+            print("Applying final vehicle optimization...")
+            final_optimized = self.operators.vehicle_consolidation_operator(
+                best_solution, distance_matrix, eta_matrix
+            )
+            final_optimized.calculate_cost_and_time(distance_matrix, eta_matrix)
+
+            if (
+                final_optimized.is_feasible
+                and final_optimized.total_cost < best_solution.total_cost
+            ):
+                best_solution = final_optimized
+                print("Final optimization improved solution")
+
+        if best_solution.is_feasible:
+            vehicle_counts = {}
+            utilization_summary = {}
+            optimized_routes = 0
+
+            for route in best_solution.routes:
+                vtype = route.vehicle_type.value
+                vehicle_counts[vtype] = vehicle_counts.get(vtype, 0) + 1
+                if route.is_optimized:
+                    optimized_routes += 1
+
+                utilization = (route.total_size / route.vehicle_spec.capacity) * 100
+                if vtype not in utilization_summary:
+                    utilization_summary[vtype] = []
+                utilization_summary[vtype].append(utilization)
+
+            # Calculate average utilizations
+            avg_utilizations = {
+                vtype: round(sum(utils) / len(utils), 1)
+                for vtype, utils in utilization_summary.items()
+            }
+
+            print(
+                f"Final solution: {len(best_solution.routes)} routes, "
+                f"cost: {best_solution.total_cost:.2f}"
+            )
+            print(f"Vehicle distribution: {vehicle_counts}")
+            print(f"Average utilizations: {avg_utilizations}")
+            print(
+                f"OR-Tools optimized routes: {optimized_routes}/{len(best_solution.routes)}"
+            )
+            print(
+                f"Max route duration: {max(r.total_duration for r in best_solution.routes)/3600:.2f}h"
+            )
+        else:
+            print("Warning: No feasible solution found!")
+            print(
+                f"Best solution: {len(best_solution.routes)} routes, "
+                f"unassigned: {len(best_solution.unassigned_parcels)} parcels"
+            )
+
+        return best_solution
+
+    def format_output(
+        self, solution: Solution, distance_matrix: Dict, eta_matrix: Dict
+    ) -> Dict:
+        """Format solution to match expected output format with OR-Tools analysis"""
+        # Build analysis
+        capacity_utilization = solution.get_capacity_utilization()
+
+        # Add empty vehicle types
+        for vehicle_type in [VehicleType.BIKE, VehicleType.BIG_BOX, VehicleType.CARBOX]:
+            if vehicle_type not in capacity_utilization:
+                capacity_utilization[vehicle_type] = []
+
+        # Knock analysis
+        knock_analysis = []
+        for pickup_id, vehicle_ids in solution.pickup_assignments.items():
+            vehicles_info = []
+            for vehicle_id in vehicle_ids:
+                # Find route for this vehicle
+                route = next(
+                    (r for r in solution.routes if r.vehicle_id == vehicle_id), None
+                )
+                if route:
+                    parcels_count = sum(
+                        1
+                        for p in route.parcels
+                        if self._get_parcel_pickup_id(p, solution) == pickup_id
+                    )
+                    vehicles_info.append(
+                        {"vehicle_id": vehicle_id, "parcels_from_pickup": parcels_count}
+                    )
+
+            knock_analysis.append(
+                {
+                    "pickup_id": pickup_id,
+                    "total_knocks": len(set(vehicle_ids)),
+                    "vehicles": vehicles_info,
+                }
+            )
+
+        # Format routes
+        formatted_routes = []
+        total_duration_seconds = 0
+        optimized_routes_count = 0
+
+        for route in solution.routes:
+            route_distance = getattr(route, "total_distance", 0)
+            route_duration = getattr(route, "total_duration", 0)
+            total_duration_seconds += route_duration
+
+            if route.is_optimized:
+                optimized_routes_count += 1
+
+            # Build physical route from optimized sequence
+            physical_route = []
+            route_indices = []
+
+            for i, (action, location) in enumerate(route.route_sequence):
+                physical_route.append((location[0], location[1]))
+                route_indices.append(i)
+
+            formatted_route = {
+                "vehicle_id": route.vehicle_id,
+                "vehicle_type": route.vehicle_type.value,
+                "parcels": [float(p.id) for p in route.parcels],
+                "route_indices": route_indices,
+                "physical_route": physical_route,
+                "route_sequence": route.route_sequence,  # Include optimized sequence
+                "num_stops": len(route.route_sequence),
+                "total_duration_seconds": int(route_duration),
+                "total_distance_m": int(route_distance),
+                "total_cost_kt": (route_distance * route.vehicle_spec.cost_per_km)
+                / 1000,
+                "capacity_used": route.total_size,
+                "vehicle_capacity": route.vehicle_spec.capacity,
+                "time_window_feasible": route.is_time_feasible(
+                    self.config.time_window_seconds
+                ),
+                "is_optimized": route.is_optimized,
+                "parcels_per_pickup": {
+                    pickup_id: len(
+                        [
+                            p
+                            for p in route.parcels
+                            if self._get_parcel_pickup_id(p, solution) == pickup_id
+                        ]
+                    )
+                    for pickup_id in route.pickup_sequence
+                },
+            }
+            formatted_routes.append(formatted_route)
+
+        # Count vehicles by type
+        vehicles_by_type = {}
+        for route in solution.routes:
+            vehicle_type = route.vehicle_type.value
+            vehicles_by_type[vehicle_type] = vehicles_by_type.get(vehicle_type, 0) + 1
+
+        # Total knocks per pickup
+        total_knocks_per_pickup = []
+        for pickup_id, vehicle_ids in solution.pickup_assignments.items():
+            total_knocks_per_pickup.append({pickup_id: len(set(vehicle_ids))})
+
+        # Time window validation
+        time_window_violations = [
+            r
+            for r in solution.routes
+            if not r.is_time_feasible(self.config.time_window_seconds)
+        ]
+
+        return {
+            "input_summary": {
+                "num_hubs": len(solution.pickup_terminals),
+                "total_parcels": sum(len(t.parcels) for t in solution.pickup_terminals),
+                "max_knock": self.config.max_knock,
+                "time_window_seconds": self.config.time_window_seconds,
+                "time_window_hours": self.config.time_window_hours,
+            },
+            "formatted_pickup_data": [
+                {
+                    "pickup_id": t.pickup_id,
+                    "lat": t.lat,
+                    "lon": t.lon,
+                    "num_parcels": len(t.parcels),
+                }
+                for t in solution.pickup_terminals
+            ],
+            "results_summary": {
+                "total_vehicles_used": len(solution.routes),
+                "vehicles_by_type": vehicles_by_type,
+                "total_knocks_per_pickup": total_knocks_per_pickup,
+                "total_cost": solution.total_cost,
+                "total_duration_seconds": total_duration_seconds,
+                "max_route_duration_seconds": max(
+                    (getattr(r, "total_duration", 0) for r in solution.routes),
+                    default=0,
+                ),
+                "time_window_feasible": len(time_window_violations) == 0,
+                "time_window_violations": len(time_window_violations),
+                "ortools_optimized_routes": optimized_routes_count,
+                "ortools_optimization_rate": (
+                    round(optimized_routes_count / len(solution.routes) * 100, 1)
+                    if solution.routes
+                    else 0
+                ),
+                "map_filename": "vehicle_routes.html",
+            },
+            "vehicles": formatted_routes,
+            "analysis": {
+                "capacity_utilization": {
+                    k.value: v for k, v in capacity_utilization.items()
+                },
+                "knock_analysis": knock_analysis,
+                "time_analysis": {
+                    "total_duration_hours": round(total_duration_seconds / 3600, 2),
+                    "max_route_duration_hours": round(
+                        max(
+                            (getattr(r, "total_duration", 0) for r in solution.routes),
+                            default=0,
+                        )
+                        / 3600,
+                        2,
+                    ),
+                    "time_window_hours": self.config.time_window_hours,
+                    "routes_violating_time_window": len(time_window_violations),
+                    "feasible": len(time_window_violations) == 0,
+                },
+                "ortools_analysis": {
+                    "optimized_routes": optimized_routes_count,
+                    "total_routes": len(solution.routes),
+                    "optimization_rate": (
+                        round(optimized_routes_count / len(solution.routes) * 100, 1)
+                        if solution.routes
+                        else 0
+                    ),
+                    "available": ORTOOLS_AVAILABLE,
+                },
+            },
+            "polygon_id": 0,
+            "processing_time": 0.0,  # Will be set by caller
+        }
+
+    def _get_parcel_pickup_id(self, parcel: Parcel, solution: Solution) -> int:
+        """Get pickup terminal ID for parcel"""
+        for terminal in solution.pickup_terminals:
+            if parcel in terminal.parcels:
+                return terminal.pickup_id
+        raise ValueError(f"Parcel {parcel.id} not found in any terminal")
+
+
+class ORToolsRouteOptimizer:
+    """OR-Tools integration for route sequence optimization"""
+    
+    def __init__(self, config: ProblemConfig):
+        self.config = config
+        
+    def optimize_route_sequence(self, route: Route, distance_matrix: Dict, 
+                              eta_matrix: Dict) -> Route:
+        """
+        Optimize pickup and delivery sequence for a single route using OR-Tools
+        
+        Args:
+            route: Route to optimize
+            distance_matrix: Distance matrix
+            eta_matrix: ETA matrix
+            
+        Returns:
+            Optimized route
+        """
+        if not ORTOOLS_AVAILABLE:
+            return self._fallback_route_optimization(route, distance_matrix, eta_matrix)
+        
+        # For small routes, use fallback (OR-Tools overhead not worth it)
+        if len(route.parcels) <= 2:
+            return self._fallback_route_optimization(route, distance_matrix, eta_matrix)
+        
+        try:
+            # Build locations list and pickup-delivery pairs
+            locations = []
+            location_to_index = {}
+            pickup_delivery_pairs = []
+            
+            # Add depot (first pickup location as starting point)
+            depot_location = route.parcels[0].pickup_location if route.parcels else (0, 0)
+            locations.append(depot_location)
+            location_to_index[depot_location] = 0
+            
+            # Add unique pickup locations
+            pickup_locations_set = set()
+            for parcel in route.parcels:
+                pickup_locations_set.add(parcel.pickup_location)
+            
+            for pickup_loc in pickup_locations_set:
+                if pickup_loc not in location_to_index:
+                    location_to_index[pickup_loc] = len(locations)
+                    locations.append(pickup_loc)
+            
+            # Add delivery locations and create pickup-delivery pairs
+            for parcel in route.parcels:
+                pickup_loc = parcel.pickup_location
+                delivery_loc = parcel.delivery_location
+                
+                # Add delivery location if not already added
+                if delivery_loc not in location_to_index:
+                    location_to_index[delivery_loc] = len(locations)
+                    locations.append(delivery_loc)
+                
+                # Create pickup-delivery pair
+                pickup_idx = location_to_index[pickup_loc]
+                delivery_idx = location_to_index[delivery_loc]
+                
+                # Only add unique pairs (avoid duplicates for same pickup-delivery)
+                if (pickup_idx, delivery_idx) not in pickup_delivery_pairs:
+                    pickup_delivery_pairs.append((pickup_idx, delivery_idx))
+            
+            # Ensure we have enough locations
+            if len(locations) < 2:
+                return self._fallback_route_optimization(route, distance_matrix, eta_matrix)
+            
+            # Create OR-Tools model
+            manager = pywrapcp.RoutingIndexManager(len(locations), 1, 0)
+            routing = pywrapcp.RoutingModel(manager)
+            
+            # Create distance callback with scaling for OR-Tools
+            def distance_callback(from_index, to_index):
+                from_node = manager.IndexToNode(from_index)
+                to_node = manager.IndexToNode(to_index)
+                if from_node >= len(locations) or to_node >= len(locations):
+                    return 0
+                from_loc = locations[from_node]
+                to_loc = locations[to_node]
+                distance = distance_matrix.get(from_loc, {}).get(to_loc, 0)
+                # Scale down distance for OR-Tools (it works better with smaller numbers)
+                return max(1, int(distance / 100))  # Convert to hectometers
+            
+            transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+            routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+            
+            # Simplified approach: just optimize the TSP without complex constraints
+            # that might make the problem infeasible
+            
+            # Only add time constraint (much more relaxed)
+            def time_callback(from_index, to_index):
+                from_node = manager.IndexToNode(from_index)
+                to_node = manager.IndexToNode(to_index)
+                if from_node >= len(locations) or to_node >= len(locations):
+                    return 0
+                from_loc = locations[from_node]
+                to_loc = locations[to_node]
+                time_val = eta_matrix.get(from_loc, {}).get(to_loc, 300)  # Default 5 min
+                return max(1, int(time_val / 60))  # Convert to minutes
+            
+            time_callback_index = routing.RegisterTransitCallback(time_callback)
+            routing.AddDimension(
+                time_callback_index,
+                self.config.time_window_seconds // 60,  # Allow slack in minutes
+                self.config.time_window_seconds // 60,  # Max time in minutes
+                True,  # Start cumul to zero
+                'Time'
+            )
+            
+            # Simpler search parameters for better success rate
+            search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+            search_parameters.first_solution_strategy = (
+                routing_enums_pb2.FirstSolutionStrategy.AUTOMATIC
+            )
+            search_parameters.local_search_metaheuristic = (
+                routing_enums_pb2.LocalSearchMetaheuristic.AUTOMATIC
+            )
+            search_parameters.time_limit.seconds = 10  # Shorter time limit
+            search_parameters.solution_limit = 1  # Just find one solution
+            
+            # Solve
+            solution = routing.SolveWithParameters(search_parameters)
+            
+            if solution:
+                # Extract optimized sequence
+                optimized_route = self._extract_optimized_route_simple(
+                    route, solution, routing, manager, locations
+                )
+                return optimized_route
+            else:
+                # OR-Tools couldn't solve - use fallback
+                return self._fallback_route_optimization(route, distance_matrix, eta_matrix)
+                
+        except Exception as e:
+            # Any error - use fallback
+            return self._fallback_route_optimization(route, distance_matrix, eta_matrix)
+    
+    def _extract_optimized_route_simple(self, original_route: Route, solution, routing, 
+                                       manager, locations: List[Tuple[float, float]]) -> Route:
+        """Extract optimized route from OR-Tools solution (simplified approach)"""
+        optimized_route = deepcopy(original_route)
+        
+        # Get the route sequence from OR-Tools solution
+        route_sequence = []
+        index = routing.Start(0)
+        visited_locations = []
+        
+        while not routing.IsEnd(index):
+            node = manager.IndexToNode(index)
+            if node < len(locations):
+                location = locations[node]
+                visited_locations.append(location)
+            index = solution.Value(routing.NextVar(index))
+        
+        # Now build the route sequence based on the optimized order
+        # We need to determine pickup vs delivery for each location
+        pickup_locations = set()
+        delivery_locations = set()
+        
+        for parcel in original_route.parcels:
+            pickup_locations.add(parcel.pickup_location)
+            delivery_locations.add(parcel.delivery_location)
+        
+        # Build sequence respecting the OR-Tools order
+        for location in visited_locations:
+            if location in pickup_locations:
+                route_sequence.append(('pickup', location))
+            elif location in delivery_locations:
+                route_sequence.append(('delivery', location))
+        
+        # Ensure we have all deliveries (add any missing ones at the end)
+        for parcel in original_route.parcels:
+            delivery_location = parcel.delivery_location
+            if not any(loc == delivery_location and action == 'delivery' 
+                      for action, loc in route_sequence):
+                route_sequence.append(('delivery', delivery_location))
+        
+        # Update route with optimized sequence
+        optimized_route.route_sequence = route_sequence
+        optimized_route.is_optimized = True
+        
+        return optimized_route
+    
+    def _extract_optimized_route(self, original_route: Route, solution, routing, 
+                               manager, locations: List[Tuple[float, float]]) -> Route:
+        """Extract optimized route from OR-Tools solution"""
+        optimized_route = deepcopy(original_route)
+        
+        # Get the route sequence
+        route_sequence = []
+        index = routing.Start(0)
+        
+        while not routing.IsEnd(index):
+            node = manager.IndexToNode(index)
+            location = locations[node]
+            
+            # Determine if this is a pickup or delivery
+            is_pickup = False
+            is_delivery = False
+            
+            # Check if this location is a pickup
+            for pickup_id in original_route.pickup_sequence:
+                pickup_location = original_route.parcels[0].pickup_location if original_route.parcels else (0, 0)
+                if pickup_location == location:
+                    is_pickup = True
+                    break
+            
+            # Check if this location is a delivery
+            for parcel in original_route.parcels:
+                if parcel.delivery_location == location:
+                    is_delivery = True
+                    break
+            
+            # Add to sequence
+            if is_pickup:
+                route_sequence.append(('pickup', location))
+            elif is_delivery:
+                route_sequence.append(('delivery', location))
+            
+            index = solution.Value(routing.NextVar(index))
+        
+        # Update route with optimized sequence
+        optimized_route.route_sequence = route_sequence
+        optimized_route.is_optimized = True
+        
+        return optimized_route
+    
+    def _fallback_route_optimization(self, route: Route, distance_matrix: Dict, 
+                                   eta_matrix: Dict) -> Route:
+        """Fallback optimization when OR-Tools is not available"""
+        optimized_route = deepcopy(route)
+        
+        # Simple TSP optimization for pickup sequence
+        if len(route.pickup_sequence) > 1:
+            optimized_pickups = self._simple_tsp_optimization(
+                route.pickup_sequence, distance_matrix, route.parcels[0].pickup_location
+            )
+            optimized_route.pickup_sequence = optimized_pickups
+        
+        # Simple TSP optimization for delivery sequence
+        if len(route.delivery_sequence) > 1:
+            optimized_deliveries = self._simple_tsp_optimization(
+                route.delivery_sequence, distance_matrix
+            )
+            optimized_route.delivery_sequence = optimized_deliveries
+        
+        # Rebuild route sequence
+        route_sequence = []
+        for pickup_id in optimized_route.pickup_sequence:
+            pickup_location = route.parcels[0].pickup_location if route.parcels else (0, 0)
+            route_sequence.append(('pickup', pickup_location))
+        
+        for delivery_loc in optimized_route.delivery_sequence:
+            route_sequence.append(('delivery', delivery_loc))
+        
+        optimized_route.route_sequence = route_sequence
+        optimized_route.is_optimized = True
+        
+        return optimized_route
+    
+    def _simple_tsp_optimization(self, locations, distance_matrix, start_location=None):
+        """Simple TSP optimization using nearest neighbor heuristic"""
+        if len(locations) <= 1:
+            return locations
+        
+        if start_location is None:
+            start_location = locations[0]
+        
+        unvisited = locations.copy()
+        if start_location in unvisited:
+            unvisited.remove(start_location)
+        
+        route = [start_location] if start_location in locations else []
+        current = start_location
+        
+        while unvisited:
+            nearest = min(unvisited, key=lambda x: distance_matrix.get(current, {}).get(x, float('inf')))
+            route.append(nearest)
+            current = nearest
+            unvisited.remove(nearest)
+        
+        return route
+
+
+class VehicleOptimizer:
+    """Handles global vehicle type optimization and fleet management"""
+
+    def __init__(self, config: ProblemConfig):
+        self.config = config
+        self.vehicle_specs = config.vehicle_specs
+        self.route_optimizer = ORToolsRouteOptimizer(config)
+
+    def optimize_vehicle_assignments(
+        self, solution: Solution, distance_matrix: Dict, eta_matrix: Dict
+    ) -> Solution:
+        """Globally optimize vehicle type assignments with route optimization"""
+        new_solution = deepcopy(solution)
+
+        # Group routes by pickup terminals for consolidation opportunities
+        terminal_routes = self._group_routes_by_terminals(new_solution.routes)
+
+        improved_routes = []
+
+        for terminal_id, routes in terminal_routes.items():
+            if len(routes) == 1:
+                # Single route - optimize vehicle type and sequence
+                optimized = self._optimize_single_route_vehicle(
+                    routes[0], distance_matrix, eta_matrix
+                )
+                improved_routes.extend(optimized)
+            else:
+                # Multiple routes - try consolidation
+                optimized = self._optimize_multi_route_consolidation(
+                    routes, terminal_id, distance_matrix, eta_matrix
+                )
+                improved_routes.extend(optimized)
+
+        new_solution.routes = improved_routes
+        new_solution._rebuild_assignments()
+        return new_solution
+
+    def _group_routes_by_terminals(self, routes: List[Route]) -> Dict[int, List[Route]]:
+        """Group routes by their pickup terminals"""
+        terminal_routes = {}
+
+        for route in routes:
+            # Use first pickup as primary terminal (simplified)
+            primary_terminal = route.pickup_sequence[0] if route.pickup_sequence else 0
+
+            if primary_terminal not in terminal_routes:
+                terminal_routes[primary_terminal] = []
+            terminal_routes[primary_terminal].append(route)
+
+        return terminal_routes
+
+    def _optimize_single_route_vehicle(
+        self, route: Route, distance_matrix: Dict, eta_matrix: Dict
+    ) -> List[Route]:
+        """Optimize vehicle type for a single route with OR-Tools sequence optimization"""
+        current_cost = self._calculate_route_total_cost(
+            route, distance_matrix, eta_matrix
+        )
+        best_route = route
+        best_cost = current_cost
+
+        # Try each vehicle type
+        for vehicle_type, vehicle_spec in self.vehicle_specs.items():
+            if vehicle_spec.capacity < route.total_size:
+                continue  # Can't fit
+
+            # Create test route with different vehicle
+            test_route = deepcopy(route)
+            test_route.vehicle_type = vehicle_type
+            test_route.vehicle_spec = vehicle_spec
+
+            # Optimize route sequence with OR-Tools
+            optimized_test_route = self.route_optimizer.optimize_route_sequence(
+                test_route, distance_matrix, eta_matrix
+            )
+
+            # Recalculate metrics
+            optimized_test_route.total_distance, optimized_test_route.total_duration = (
+                self._calculate_route_metrics(
+                    optimized_test_route, distance_matrix, eta_matrix
+                )
+            )
+
+            # Check time feasibility
+            if not optimized_test_route.is_time_feasible(
+                self.config.time_window_seconds
+            ):
+                continue
+
+            # Calculate cost
+            test_cost = self._calculate_route_total_cost(
+                optimized_test_route, distance_matrix, eta_matrix
+            )
+
+            if test_cost < best_cost:
+                best_route = optimized_test_route
+                best_cost = test_cost
+
+        return [best_route]
+
+    def _optimize_multi_route_consolidation(
+        self,
+        routes: List[Route],
+        terminal_id: int,
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+    ) -> List[Route]:
+        """Try to consolidate multiple routes into fewer, larger vehicles with OR-Tools optimization"""
+        if len(routes) <= 1:
+            return routes
+
+        # Current total cost
+        current_cost = sum(
+            self._calculate_route_total_cost(r, distance_matrix, eta_matrix)
+            for r in routes
+        )
+
+        best_routes = routes
+        best_cost = current_cost
+
+        # Try consolidation with each vehicle type
+        for vehicle_type, vehicle_spec in self.vehicle_specs.items():
+            consolidated_routes = self._try_consolidation_with_vehicle(
+                routes, vehicle_type, vehicle_spec, distance_matrix, eta_matrix
+            )
+
+            if consolidated_routes:
+                consolidated_cost = sum(
+                    self._calculate_route_total_cost(r, distance_matrix, eta_matrix)
+                    for r in consolidated_routes
+                )
+
+                if consolidated_cost < best_cost:
+                    best_routes = consolidated_routes
+                    best_cost = consolidated_cost
+
+        # Try partial consolidations (2 routes at a time, 3 routes, etc.)
+        for combo_size in range(2, len(routes) + 1):
+            partial_consolidations = self._try_partial_consolidations(
+                routes, combo_size, distance_matrix, eta_matrix
+            )
+
+            if partial_consolidations:
+                partial_cost = sum(
+                    self._calculate_route_total_cost(r, distance_matrix, eta_matrix)
+                    for r in partial_consolidations
+                )
+
+                if partial_cost < best_cost:
+                    best_routes = partial_consolidations
+                    best_cost = partial_cost
+
+        return best_routes
+
+    def _try_consolidation_with_vehicle(
+        self,
+        routes: List[Route],
+        vehicle_type: VehicleType,
+        vehicle_spec: VehicleSpec,
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+    ) -> Optional[List[Route]]:
+        """Try to consolidate all routes into single vehicle type with OR-Tools optimization"""
+        total_size = sum(route.total_size for route in routes)
+
+        if total_size > vehicle_spec.capacity:
+            return None  # Won't fit
+
+        # Combine all parcels
+        all_parcels = []
+        pickup_sequences = set()
+
+        for route in routes:
+            all_parcels.extend(route.parcels)
+            pickup_sequences.update(route.pickup_sequence)
+
+        # Create consolidated route
+        consolidated_route = Route(
+            vehicle_id=routes[0].vehicle_id,  # Use first vehicle ID
+            vehicle_type=vehicle_type,
+            vehicle_spec=vehicle_spec,
+            parcels=all_parcels,
+            pickup_sequence=list(pickup_sequences),
+            delivery_sequence=[p.delivery_location for p in all_parcels],
+        )
+
+        # Optimize route sequence with OR-Tools
+        optimized_consolidated = self.route_optimizer.optimize_route_sequence(
+            consolidated_route, distance_matrix, eta_matrix
+        )
+
+        # Calculate metrics
+        optimized_consolidated.total_distance, optimized_consolidated.total_duration = (
+            self._calculate_route_metrics(
+                optimized_consolidated, distance_matrix, eta_matrix
+            )
+        )
+
+        # Check time feasibility
+        if not optimized_consolidated.is_time_feasible(self.config.time_window_seconds):
+            return None
+
+        return [optimized_consolidated]
+
+    def _try_partial_consolidations(
+        self,
+        routes: List[Route],
+        combo_size: int,
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+    ) -> Optional[List[Route]]:
+        """Try consolidating subsets of routes with OR-Tools optimization"""
+        from itertools import combinations
+
+        if combo_size >= len(routes):
+            return None
+
+        best_combination = None
+        best_cost_saving = 0
+
+        # Try all combinations of combo_size routes
+        for route_combo in combinations(routes, combo_size):
+            remaining_routes = [r for r in routes if r not in route_combo]
+
+            # Try consolidating this combination
+            for vehicle_type, vehicle_spec in self.vehicle_specs.items():
+                consolidated = self._try_consolidation_with_vehicle(
+                    list(route_combo),
+                    vehicle_type,
+                    vehicle_spec,
+                    distance_matrix,
+                    eta_matrix,
+                )
+
+                if consolidated:
+                    # Calculate cost saving
+                    original_cost = sum(
+                        self._calculate_route_total_cost(r, distance_matrix, eta_matrix)
+                        for r in route_combo
+                    )
+                    new_cost = self._calculate_route_total_cost(
+                        consolidated[0], distance_matrix, eta_matrix
+                    )
+                    cost_saving = original_cost - new_cost
+
+                    if cost_saving > best_cost_saving:
+                        best_cost_saving = cost_saving
+                        best_combination = consolidated + remaining_routes
+
+        return best_combination
+
+    def _calculate_route_metrics(
+        self, route: Route, distance_matrix: Dict, eta_matrix: Dict
+    ) -> Tuple[float, int]:
+        """Calculate distance and duration for route using optimized sequence"""
+        total_distance = 0
+        total_duration = 0
+
+        if not route.route_sequence:
+            return 0, 0
+
+        # Get locations from optimized sequence
+        route_locations = route.get_locations_sequence()
+
+        # Calculate cumulative metrics
+        for i in range(len(route_locations) - 1):
+            loc1 = route_locations[i]
+            loc2 = route_locations[i + 1]
+
+            distance = distance_matrix.get(loc1, {}).get(loc2, 0)
+            travel_time = eta_matrix.get(loc1, {}).get(loc2, 0)
+
+            total_distance += distance
+            total_duration += travel_time
+
+        return total_distance, total_duration
+
+    def _calculate_route_total_cost(
+        self, route: Route, distance_matrix: Dict, eta_matrix: Dict
+    ) -> float:
+        """Calculate total cost including utilization penalties"""
+        if not hasattr(route, "total_distance") or route.total_distance == 0:
+            route.total_distance, route.total_duration = self._calculate_route_metrics(
+                route, distance_matrix, eta_matrix
+            )
+
+        return route.vehicle_spec.calculate_total_route_cost(
+            route.total_distance, route.total_size, include_fixed=True
+        )
+
+    def calculate_fleet_cost(
+        self, solution: Solution, distance_matrix: Dict, eta_matrix: Dict
+    ) -> Dict:
+        """Calculate comprehensive fleet cost analysis"""
+        vehicle_counts = {}
+        total_variable_cost = 0
+        total_fixed_cost = 0
+        utilization_analysis = {}
+
+        for route in solution.routes:
+            vehicle_type = route.vehicle_type
+
+            # Count vehicles
+            vehicle_counts[vehicle_type] = vehicle_counts.get(vehicle_type, 0) + 1
+
+            # Calculate costs
+            route_cost = self._calculate_route_total_cost(
+                route, distance_matrix, eta_matrix
+            )
+            variable_cost = route.total_distance * route.vehicle_spec.cost_per_km
+            fixed_cost = route.vehicle_spec.fixed_cost_per_vehicle
+
+            total_variable_cost += variable_cost
+            total_fixed_cost += fixed_cost
+
+            # Utilization analysis
+            if vehicle_type not in utilization_analysis:
+                utilization_analysis[vehicle_type] = {
+                    "routes": [],
+                    "avg_utilization": 0,
+                    "total_capacity": 0,
+                    "total_used": 0,
+                }
+
+            utilization = route.total_size / route.vehicle_spec.capacity
+            utilization_analysis[vehicle_type]["routes"].append(
+                {
+                    "vehicle_id": route.vehicle_id,
+                    "utilization": round(utilization * 100, 1),
+                    "capacity_used": route.total_size,
+                    "capacity_total": route.vehicle_spec.capacity,
+                    "is_optimized": route.is_optimized,
+                }
+            )
+            utilization_analysis[vehicle_type][
+                "total_capacity"
+            ] += route.vehicle_spec.capacity
+            utilization_analysis[vehicle_type]["total_used"] += route.total_size
+
+        # Calculate average utilizations
+        for vehicle_type, analysis in utilization_analysis.items():
+            if analysis["total_capacity"] > 0:
+                analysis["avg_utilization"] = round(
+                    (analysis["total_used"] / analysis["total_capacity"]) * 100, 1
+                )
+
+        return {
+            "vehicle_counts": {vt.value: count for vt, count in vehicle_counts.items()},
+            "total_cost": total_variable_cost + total_fixed_cost,
+            "variable_cost": total_variable_cost,
+            "fixed_cost": total_fixed_cost,
+            "utilization_analysis": {
+                vt.value: analysis for vt, analysis in utilization_analysis.items()
+            },
+            "cost_per_vehicle_type": {
+                vt.value: {
+                    "count": vehicle_counts.get(vt, 0),
+                    "total_cost": vehicle_counts.get(vt, 0)
+                    * spec.fixed_cost_per_vehicle,
+                }
+                for vt, spec in self.vehicle_specs.items()
+            },
+        }
+
+
+class ConstructionHeuristic:
+    """Construction heuristics for initial solution"""
+
+    def __init__(self, config: ProblemConfig):
+        self.config = config
+        self.route_optimizer = ORToolsRouteOptimizer(config)
+
+    def greedy_construction(
+        self,
+        pickup_terminals: List[PickupTerminal],
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+    ) -> Solution:
+        """Greedy construction heuristic with time window validation and OR-Tools optimization"""
+        solution = Solution(pickup_terminals, self.config.vehicle_specs)
+        vehicle_counter = 1
+
+        # Sort terminals by number of parcels (descending)
+        sorted_terminals = sorted(
+            pickup_terminals, key=lambda x: len(x.parcels), reverse=True
+        )
+
+        for terminal in sorted_terminals:
+            remaining_parcels = terminal.parcels.copy()
+
+            while remaining_parcels:
+                # Select best vehicle type for remaining parcels
+                best_vehicle_type = self._select_best_vehicle_type(remaining_parcels)
+                vehicle_spec = self.config.vehicle_specs[best_vehicle_type]
+
+                # Create route with maximum parcels that fit (considering time)
+                route_parcels = self._pack_parcels_with_time_constraint(
+                    remaining_parcels,
+                    vehicle_spec,
+                    terminal,
+                    distance_matrix,
+                    eta_matrix,
+                )
+
+                if not route_parcels:
+                    # If no parcels fit, mark as unassigned
+                    solution.unassigned_parcels.extend(remaining_parcels)
+                    break
+
+                # Create route
+                route = Route(
+                    vehicle_id=vehicle_counter,
+                    vehicle_type=best_vehicle_type,
+                    vehicle_spec=vehicle_spec,
+                    parcels=route_parcels,
+                    pickup_sequence=[terminal.pickup_id],
+                    delivery_sequence=[p.delivery_location for p in route_parcels],
+                )
+
+                # Optimize route sequence with OR-Tools
+                optimized_route = self.route_optimizer.optimize_route_sequence(
+                    route, distance_matrix, eta_matrix
+                )
+
+                # Calculate route metrics
+                optimized_route.total_distance, optimized_route.total_duration = (
+                    solution._calculate_route_metrics(
+                        optimized_route, distance_matrix, eta_matrix
+                    )
+                )
+
+                # Check time window constraint
+                if optimized_route.is_time_feasible(self.config.time_window_seconds):
+                    solution.add_route(optimized_route)
+                    vehicle_counter += 1
+
+                    # Remove assigned parcels
+                    for parcel in route_parcels:
+                        remaining_parcels.remove(parcel)
+                else:
+                    # If time constraint violated, try with fewer parcels
+                    if len(route_parcels) > 1:
+                        # Retry with half the parcels
+                        reduced_parcels = route_parcels[: len(route_parcels) // 2]
+                        reduced_route = Route(
+                            vehicle_id=vehicle_counter,
+                            vehicle_type=best_vehicle_type,
+                            vehicle_spec=vehicle_spec,
+                            parcels=reduced_parcels,
+                            pickup_sequence=[terminal.pickup_id],
+                            delivery_sequence=[
+                                p.delivery_location for p in reduced_parcels
+                            ],
+                        )
+
+                        # Optimize reduced route
+                        optimized_reduced_route = (
+                            self.route_optimizer.optimize_route_sequence(
+                                reduced_route, distance_matrix, eta_matrix
+                            )
+                        )
+
+                        (
+                            optimized_reduced_route.total_distance,
+                            optimized_reduced_route.total_duration,
+                        ) = solution._calculate_route_metrics(
+                            optimized_reduced_route, distance_matrix, eta_matrix
+                        )
+
+                        if optimized_reduced_route.is_time_feasible(
+                            self.config.time_window_seconds
+                        ):
+                            solution.add_route(optimized_reduced_route)
+                            vehicle_counter += 1
+
+                            # Remove assigned parcels
+                            for parcel in reduced_parcels:
+                                remaining_parcels.remove(parcel)
+                        else:
+                            # Can't fit even reduced parcels, mark as unassigned
+                            solution.unassigned_parcels.extend(remaining_parcels)
+                            break
+                    else:
+                        # Single parcel doesn't fit time window
+                        solution.unassigned_parcels.extend(remaining_parcels)
+                        break
+
+        # Calculate solution metrics
+        solution.calculate_cost_and_time(distance_matrix, eta_matrix)
+        solution.is_feasible = (
+            len(solution.unassigned_parcels) == 0
+            and solution.validate_knock_constraints(self.config.max_knock)
+            and solution.validate_time_window(self.config.time_window_seconds)
+        )
+
+        return solution
+
+    def _select_best_vehicle_type(self, parcels: List[Parcel]) -> VehicleType:
+        """Select best vehicle type for given parcels"""
+        total_size = sum(p.size for p in parcels)
+
+        # Find cheapest vehicle that can fit all parcels
+        best_type = None
+        best_cost_efficiency = float("inf")
+
+        for vehicle_type, spec in self.config.vehicle_specs.items():
+            if spec.capacity >= total_size:
+                cost_efficiency = spec.cost_per_km / spec.capacity
+                if cost_efficiency < best_cost_efficiency:
+                    best_cost_efficiency = cost_efficiency
+                    best_type = vehicle_type
+
+        # If no single vehicle can fit all, choose highest capacity
+        if best_type is None:
+            best_type = max(
+                self.config.vehicle_specs.keys(),
+                key=lambda x: self.config.vehicle_specs[x].capacity,
+            )
+
+        return best_type
+
+    def _pack_parcels_with_time_constraint(
+        self,
+        parcels: List[Parcel],
+        vehicle_spec: VehicleSpec,
+        terminal: PickupTerminal,
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+    ) -> List[Parcel]:
+        """Pack parcels considering both capacity and time constraints"""
+        # Sort parcels by delivery distance (closest first for time efficiency)
+        terminal_location = (terminal.lat, terminal.lon)
+
+        def delivery_distance(parcel):
+            return distance_matrix.get(terminal_location, {}).get(
+                parcel.delivery_location, float("inf")
+            )
+
+        sorted_parcels = sorted(parcels, key=delivery_distance)
+
+        packed = []
+        current_size = 0
+
+        for parcel in sorted_parcels:
+            if current_size + parcel.size <= vehicle_spec.capacity:
+                # Create temporary route to check time constraint
+                temp_parcels = packed + [parcel]
+                temp_route = Route(
+                    vehicle_id=0,  # Temporary
+                    vehicle_type=vehicle_spec.vehicle_type,
+                    vehicle_spec=vehicle_spec,
+                    parcels=temp_parcels,
+                    pickup_sequence=[terminal.pickup_id],
+                    delivery_sequence=[p.delivery_location for p in temp_parcels],
+                )
+
+                # Calculate route duration with simple estimation
+                route_distance, route_duration = self._calculate_temp_route_metrics(
+                    temp_route, distance_matrix, eta_matrix
+                )
+
+                # Check if adding this parcel violates time window
+                if route_duration <= self.config.time_window_seconds:
+                    packed.append(parcel)
+                    current_size += parcel.size
+                else:
+                    # Stop packing if time window would be violated
+                    break
+
+        return packed
+
+    def _calculate_temp_route_metrics(
+        self, route: Route, distance_matrix: Dict, eta_matrix: Dict
+    ) -> Tuple[float, int]:
+        """Calculate metrics for temporary route during construction"""
+        total_distance = 0
+        total_duration = 0
+
+        if not route.pickup_sequence and not route.delivery_sequence:
+            return 0, 0
+
+        # Build route locations (simple: pickups then deliveries)
+        route_locations = []
+
+        # Add pickup location
+        if route.pickup_sequence:
+            pickup_location = route.parcels[0].pickup_location
+            route_locations.append(pickup_location)
+
+        # Add delivery locations
+        for delivery_location in route.delivery_sequence:
+            route_locations.append(delivery_location)
+
+        # Calculate cumulative metrics
+        for i in range(len(route_locations) - 1):
+            loc1 = route_locations[i]
+            loc2 = route_locations[i + 1]
+
+            distance = distance_matrix.get(loc1, {}).get(loc2, 0)
+            travel_time = eta_matrix.get(loc1, {}).get(loc2, 0)
+
+            total_distance += distance
+            total_duration += travel_time
+
+        return total_distance, total_duration
+
+
+class ALNSOperators:
+    """ALNS destroy and repair operators with vehicle optimization and OR-Tools"""
+
+    def __init__(self, config: ProblemConfig):
+        self.config = config
+        self.random = random.Random(42)  # For reproducibility
+        self.vehicle_optimizer = VehicleOptimizer(config)
+        self.route_optimizer = ORToolsRouteOptimizer(config)
+
+    # Vehicle Type Optimization Operators
+    def vehicle_consolidation_operator(
+        self, solution: Solution, distance_matrix: Dict, eta_matrix: Dict
+    ) -> Solution:
+        """Try to consolidate routes using larger vehicles with OR-Tools optimization"""
+        return self.vehicle_optimizer.optimize_vehicle_assignments(
+            solution, distance_matrix, eta_matrix
+        )
+
+    def vehicle_type_swap_operator(
+        self,
+        solution: Solution,
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+        num_swaps: int = 2,
+    ) -> Solution:
+        """Randomly swap vehicle types for routes with OR-Tools optimization"""
+        new_solution = deepcopy(solution)
+
+        if not new_solution.routes:
+            return new_solution
+
+        # Select random routes to modify
+        routes_to_modify = self.random.sample(
+            new_solution.routes, min(num_swaps, len(new_solution.routes))
+        )
+
+        for route in routes_to_modify:
+            # Try different vehicle types
+            original_type = route.vehicle_type
+            available_types = [
+                vt for vt in self.config.vehicle_specs.keys() if vt != original_type
+            ]
+
+            if not available_types:
+                continue
+
+            # Try random vehicle type
+            new_type = self.random.choice(available_types)
+            new_spec = self.config.vehicle_specs[new_type]
+
+            # Check if parcels fit
+            if route.total_size <= new_spec.capacity:
+                route.vehicle_type = new_type
+                route.vehicle_spec = new_spec
+
+                # Optimize route sequence with OR-Tools
+                optimized_route = self.route_optimizer.optimize_route_sequence(
+                    route, distance_matrix, eta_matrix
+                )
+
+                # Update route with optimized version
+                route.route_sequence = optimized_route.route_sequence
+                route.is_optimized = optimized_route.is_optimized
+
+                # Recalculate metrics
+                route.total_distance, route.total_duration = (
+                    self.vehicle_optimizer._calculate_route_metrics(
+                        route, distance_matrix, eta_matrix
+                    )
+                )
+
+                # Revert if time constraint violated
+                if not route.is_time_feasible(self.config.time_window_seconds):
+                    route.vehicle_type = original_type
+                    route.vehicle_spec = self.config.vehicle_specs[original_type]
+                    route.is_optimized = False
+
+        return new_solution
+
+    def route_splitting_operator(
+        self, solution: Solution, distance_matrix: Dict, eta_matrix: Dict
+    ) -> Solution:
+        """Split over-utilized or large routes into smaller vehicles with OR-Tools optimization"""
+        new_solution = deepcopy(solution)
+
+        routes_to_split = []
+
+        # Find routes that could benefit from splitting
+        for route in new_solution.routes:
+            utilization = route.total_size / route.vehicle_spec.capacity
+
+            # Split if over-utilized or time-constrained
+            if (
+                utilization > 0.9
+                or not route.is_time_feasible(self.config.time_window_seconds)
+                or len(route.parcels) > 10
+            ):  # Arbitrary large route threshold
+                routes_to_split.append(route)
+
+        # Try to split selected routes
+        for route in routes_to_split:
+            split_routes = self._try_split_route(route, distance_matrix, eta_matrix)
+            if split_routes and len(split_routes) > 1:
+                # Calculate costs
+                original_cost = self.vehicle_optimizer._calculate_route_total_cost(
+                    route, distance_matrix, eta_matrix
+                )
+                split_cost = sum(
+                    self.vehicle_optimizer._calculate_route_total_cost(
+                        r, distance_matrix, eta_matrix
+                    )
+                    for r in split_routes
+                )
+
+                # Accept if cost improvement or better feasibility
+                if (
+                    split_cost < original_cost * 1.1  # Allow 10% cost increase
+                    or any(
+                        not r.is_time_feasible(self.config.time_window_seconds)
+                        for r in [route]
+                    )
+                    and all(
+                        r.is_time_feasible(self.config.time_window_seconds)
+                        for r in split_routes
+                    )
+                ):
+
+                    # Replace original route with split routes
+                    new_solution.routes.remove(route)
+                    new_solution.routes.extend(split_routes)
+
+        return new_solution
+
+    def _try_split_route(
+        self, route: Route, distance_matrix: Dict, eta_matrix: Dict
+    ) -> Optional[List[Route]]:
+        """Attempt to split a route into smaller routes with OR-Tools optimization"""
+        if len(route.parcels) < 2:
+            return None
+
+        # Sort parcels by delivery distance for better splitting
+        if route.pickup_sequence:
+            pickup_location = route.parcels[0].pickup_location
+            sorted_parcels = sorted(
+                route.parcels,
+                key=lambda p: distance_matrix.get(pickup_location, {}).get(
+                    p.delivery_location, 0
+                ),
+            )
+        else:
+            sorted_parcels = route.parcels.copy()
+
+        # Try splitting into 2 parts
+        split_point = len(sorted_parcels) // 2
+        part1_parcels = sorted_parcels[:split_point]
+        part2_parcels = sorted_parcels[split_point:]
+
+        # Find suitable vehicle types for each part
+        split_routes = []
+        next_vehicle_id = max([r.vehicle_id for r in [route]], default=0) + 1
+
+        for i, parcels_subset in enumerate([part1_parcels, part2_parcels]):
+            if not parcels_subset:
+                continue
+
+            subset_size = sum(p.size for p in parcels_subset)
+
+            # Find best vehicle type for this subset
+            best_vehicle_type = None
+            best_cost = float("inf")
+
+            for vehicle_type, vehicle_spec in self.config.vehicle_specs.items():
+                if vehicle_spec.capacity >= subset_size:
+                    # Create test route
+                    test_route = Route(
+                        vehicle_id=next_vehicle_id + i,
+                        vehicle_type=vehicle_type,
+                        vehicle_spec=vehicle_spec,
+                        parcels=parcels_subset,
+                        pickup_sequence=route.pickup_sequence.copy(),
+                        delivery_sequence=[p.delivery_location for p in parcels_subset],
+                    )
+
+                    # Optimize with OR-Tools
+                    optimized_test_route = self.route_optimizer.optimize_route_sequence(
+                        test_route, distance_matrix, eta_matrix
+                    )
+
+                    # Calculate metrics
+                    (
+                        optimized_test_route.total_distance,
+                        optimized_test_route.total_duration,
+                    ) = self.vehicle_optimizer._calculate_route_metrics(
+                        optimized_test_route, distance_matrix, eta_matrix
+                    )
+
+                    # Check time feasibility
+                    if optimized_test_route.is_time_feasible(
+                        self.config.time_window_seconds
+                    ):
+                        test_cost = self.vehicle_optimizer._calculate_route_total_cost(
+                            optimized_test_route, distance_matrix, eta_matrix
+                        )
+
+                        if test_cost < best_cost:
+                            best_cost = test_cost
+                            best_vehicle_type = vehicle_type
+
+            # Create final route with best vehicle type
+            if best_vehicle_type:
+                final_route = Route(
+                    vehicle_id=next_vehicle_id + i,
+                    vehicle_type=best_vehicle_type,
+                    vehicle_spec=self.config.vehicle_specs[best_vehicle_type],
+                    parcels=parcels_subset,
+                    pickup_sequence=route.pickup_sequence.copy(),
+                    delivery_sequence=[p.delivery_location for p in parcels_subset],
+                )
+
+                # Optimize with OR-Tools
+                optimized_final_route = self.route_optimizer.optimize_route_sequence(
+                    final_route, distance_matrix, eta_matrix
+                )
+
+                # Set metrics
+                (
+                    optimized_final_route.total_distance,
+                    optimized_final_route.total_duration,
+                ) = self.vehicle_optimizer._calculate_route_metrics(
+                    optimized_final_route, distance_matrix, eta_matrix
+                )
+
+                split_routes.append(optimized_final_route)
+
+        return split_routes if len(split_routes) >= 2 else None
+
+    # Destroy operators
+    def random_removal(self, solution: Solution, removal_rate: float = 0.3) -> Solution:
+        """Randomly remove parcels from solution"""
+        new_solution = deepcopy(solution)
+
+        if not new_solution.routes:
+            return new_solution
+
+        # Calculate number of parcels to remove
+        total_parcels = sum(len(route.parcels) for route in new_solution.routes)
+        num_to_remove = max(1, int(total_parcels * removal_rate))
+
+        # Collect all parcels with their route info
+        all_parcels = []
+        for route_idx, route in enumerate(new_solution.routes):
+            for parcel in route.parcels:
+                all_parcels.append((parcel, route_idx))
+
+        # Randomly select parcels to remove
+        to_remove = self.random.sample(
+            all_parcels, min(num_to_remove, len(all_parcels))
+        )
+
+        # Remove parcels from routes
+        for parcel, route_idx in to_remove:
+            new_solution.routes[route_idx].parcels.remove(parcel)
+            new_solution.unassigned_parcels.append(parcel)
+
+            # Update delivery sequence
+            if (
+                parcel.delivery_location
+                in new_solution.routes[route_idx].delivery_sequence
+            ):
+                new_solution.routes[route_idx].delivery_sequence.remove(
+                    parcel.delivery_location
+                )
+
+        # Remove empty routes and re-optimize remaining routes
+        remaining_routes = []
+        for route in new_solution.routes:
+            if route.parcels:
+                # Re-optimize route after parcel removal
+                optimized_route = self.route_optimizer.optimize_route_sequence(
+                    route, {}, {}  # Will be recalculated later
+                )
+                remaining_routes.append(optimized_route)
+
+        new_solution.routes = remaining_routes
+
+        return new_solution
+
+    def terminal_removal(self, solution: Solution, num_terminals: int = 1) -> Solution:
+        """Remove all parcels from selected terminals"""
+        new_solution = deepcopy(solution)
+
+        if not new_solution.routes:
+            return new_solution
+
+        # Get all pickup terminals that have routes
+        active_terminals = set()
+        for route in new_solution.routes:
+            active_terminals.update(route.pickup_sequence)
+
+        if not active_terminals:
+            return new_solution
+
+        # Select terminals to remove
+        terminals_to_remove = self.random.sample(
+            list(active_terminals), min(num_terminals, len(active_terminals))
+        )
+
+        # Remove parcels from selected terminals
+        for route in new_solution.routes:
+            parcels_to_remove = []
+            for parcel in route.parcels:
+                # Find which terminal this parcel belongs to
+                for terminal in new_solution.pickup_terminals:
+                    if (
+                        parcel in terminal.parcels
+                        and terminal.pickup_id in terminals_to_remove
+                    ):
+                        parcels_to_remove.append(parcel)
+                        break
+
+            # Remove parcels and add to unassigned
+            for parcel in parcels_to_remove:
+                route.parcels.remove(parcel)
+                new_solution.unassigned_parcels.append(parcel)
+
+                # Update delivery sequence
+                if parcel.delivery_location in route.delivery_sequence:
+                    route.delivery_sequence.remove(parcel.delivery_location)
+
+        # Remove empty routes and re-optimize remaining routes
+        # remaining_routes = []
+        # for route in new_solution.routes:
+        #     if
+        # Remove empty routes and re-optimize remaining routes
+        remaining_routes = []
+        for route in new_solution.routes:
+            if route.parcels:
+                # Re-optimize route after parcel removal
+                optimized_route = self.route_optimizer.optimize_route_sequence(
+                    route, {}, {}  # Will be recalculated later
+                )
+                remaining_routes.append(optimized_route)
+
+        new_solution.routes = remaining_routes
+
+        return new_solution
+
+    # Repair operators
+    def greedy_insertion(
+        self, solution: Solution, distance_matrix: Dict, eta_matrix: Dict
+    ) -> Solution:
+        """Greedily insert unassigned parcels with time constraint validation and OR-Tools optimization"""
+        new_solution = deepcopy(solution)
+
+        # Sort unassigned parcels by size (largest first)
+        unassigned = sorted(
+            new_solution.unassigned_parcels, key=lambda x: x.size, reverse=True
+        )
+
+        for parcel in unassigned:
+            best_insertion = self._find_best_insertion_with_time(
+                parcel, new_solution, distance_matrix, eta_matrix
+            )
+
+            if best_insertion:
+                route_idx, insertion_cost = best_insertion
+                new_solution.routes[route_idx].parcels.append(parcel)
+                new_solution.unassigned_parcels.remove(parcel)
+
+                # Update route delivery sequence
+                new_solution.routes[route_idx].delivery_sequence.append(
+                    parcel.delivery_location
+                )
+
+                # Re-optimize route with OR-Tools
+                optimized_route = self.route_optimizer.optimize_route_sequence(
+                    new_solution.routes[route_idx], distance_matrix, eta_matrix
+                )
+
+                # Update route with optimized version
+                new_solution.routes[route_idx] = optimized_route
+
+                # Recalculate route metrics
+                route = new_solution.routes[route_idx]
+                route.total_distance, route.total_duration = (
+                    new_solution._calculate_route_metrics(
+                        route, distance_matrix, eta_matrix
+                    )
+                )
+
+            else:
+                # Create new route if no insertion found
+                new_route = self._create_new_route_with_time(
+                    parcel, new_solution, distance_matrix, eta_matrix
+                )
+                if new_route:
+                    new_solution.add_route(new_route)
+                    new_solution.unassigned_parcels.remove(parcel)
+
+        return new_solution
+
+    def _find_best_insertion_with_time(
+        self,
+        parcel: Parcel,
+        solution: Solution,
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+    ) -> Optional[Tuple[int, float]]:
+        """Find best insertion position for parcel considering time constraints"""
+        best_route_idx = None
+        best_cost = float("inf")
+
+        for route_idx, route in enumerate(solution.routes):
+            # Check capacity constraint
+            if route.total_size + parcel.size > route.vehicle_spec.capacity:
+                continue
+
+            # Check knock constraint
+            parcel_pickup_id = self._get_parcel_pickup_id(parcel, solution)
+            if parcel_pickup_id not in route.pickup_sequence:
+                # Check if adding this pickup violates knock constraint
+                current_knocks = len(
+                    solution.pickup_assignments.get(parcel_pickup_id, [])
+                )
+                if current_knocks >= self.config.max_knock:
+                    continue
+
+            # Check time constraint by testing insertion
+            temp_route = deepcopy(route)
+            temp_route.parcels.append(parcel)
+            temp_route.delivery_sequence.append(parcel.delivery_location)
+
+            # Optimize temporary route
+            optimized_temp_route = self.route_optimizer.optimize_route_sequence(
+                temp_route, distance_matrix, eta_matrix
+            )
+
+            # Calculate new route duration
+            route_distance, route_duration = solution._calculate_route_metrics(
+                optimized_temp_route, distance_matrix, eta_matrix
+            )
+
+            # Skip if time window violated
+            if route_duration > self.config.time_window_seconds:
+                continue
+
+            # Calculate insertion cost
+            insertion_cost = self._calculate_insertion_cost_with_time(
+                parcel, route, distance_matrix, eta_matrix
+            )
+
+            if insertion_cost < best_cost:
+                best_cost = insertion_cost
+                best_route_idx = route_idx
+
+        return (best_route_idx, best_cost) if best_route_idx is not None else None
+
+    def _calculate_insertion_cost_with_time(
+        self, parcel: Parcel, route: Route, distance_matrix: Dict, eta_matrix: Dict
+    ) -> float:
+        """Calculate cost of inserting parcel into route including time penalty"""
+        # Base cost: distance increase
+        base_cost = parcel.size * route.vehicle_spec.cost_per_km
+
+        # Time penalty: penalize routes that are getting close to time limit
+        current_duration = getattr(route, "total_duration", 0)
+        time_window = self.config.time_window_seconds
+
+        if current_duration > 0 and time_window > 0:
+            time_utilization = current_duration / time_window
+            time_penalty = (
+                base_cost * time_utilization * 0.5
+            )  # 50% penalty for high time utilization
+        else:
+            time_penalty = 0
+
+        return base_cost + time_penalty
+
+    def _create_new_route_with_time(
+        self,
+        parcel: Parcel,
+        solution: Solution,
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+    ) -> Optional[Route]:
+        """Create new route for parcel with time validation and OR-Tools optimization"""
+        # Find parcel's pickup terminal
+        pickup_terminal = None
+        for terminal in solution.pickup_terminals:
+            if parcel in terminal.parcels:
+                pickup_terminal = terminal
+                break
+
+        if not pickup_terminal:
+            return None
+
+        # Select best vehicle type
+        best_vehicle_type = None
+        best_cost_efficiency = float("inf")
+        best_optimized_route = None
+
+        for vehicle_type, spec in self.config.vehicle_specs.items():
+            if spec.capacity >= parcel.size:
+                # Create temporary route
+                temp_route = Route(
+                    vehicle_id=0,  # Temporary
+                    vehicle_type=vehicle_type,
+                    vehicle_spec=spec,
+                    parcels=[parcel],
+                    pickup_sequence=[pickup_terminal.pickup_id],
+                    delivery_sequence=[parcel.delivery_location],
+                )
+
+                # Optimize with OR-Tools
+                optimized_temp_route = self.route_optimizer.optimize_route_sequence(
+                    temp_route, distance_matrix, eta_matrix
+                )
+
+                # Calculate route duration
+                route_distance, route_duration = solution._calculate_route_metrics(
+                    optimized_temp_route, distance_matrix, eta_matrix
+                )
+
+                # Check time feasibility
+                if route_duration <= self.config.time_window_seconds:
+                    cost_efficiency = spec.cost_per_km / spec.capacity
+                    if cost_efficiency < best_cost_efficiency:
+                        best_cost_efficiency = cost_efficiency
+                        best_vehicle_type = vehicle_type
+                        best_optimized_route = optimized_temp_route
+
+        if not best_vehicle_type or not best_optimized_route:
+            return None
+
+        # Create final route
+        vehicle_id = max([r.vehicle_id for r in solution.routes], default=0) + 1
+        final_route = deepcopy(best_optimized_route)
+        final_route.vehicle_id = vehicle_id
+
+        # Calculate and set route metrics
+        final_route.total_distance, final_route.total_duration = (
+            solution._calculate_route_metrics(final_route, distance_matrix, eta_matrix)
+        )
+
+        return final_route
+
+    def _get_parcel_pickup_id(self, parcel: Parcel, solution: Solution) -> int:
+        """Get pickup terminal ID for parcel"""
+        for terminal in solution.pickup_terminals:
+            if parcel in terminal.parcels:
+                return terminal.pickup_id
+        raise ValueError(f"Parcel {parcel.id} not found in any terminal")
+
+
+def create_problem_from_csv(
+    df: pd.DataFrame,
+    max_knock: int = 4,
+    time_window_hours: float = 6.0,
+    default_parcel_size: int = 1,
+    proximity_threshold_meters: float = 100.0,
+) -> Tuple[ProblemConfig, List[PickupTerminal], Dict]:
+    """
+    Main function to create problem from CSV data
+
+    Args:
+        csv_file_path: Path to CSV file
+        max_knock: Maximum knocks per pickup terminal
+        time_window_hours: Time window in hours
+        default_parcel_size: Default size for parcels
+        proximity_threshold_meters: Distance threshold to group pickup locations
+
+    Returns:
+        Tuple of (ProblemConfig, List[PickupTerminal], data_summary)
+    """
+    # Define vehicle types (customize as needed)
+    vehicle_specs = {
+        VehicleType.BIKE: VehicleSpec(
+            VehicleType.BIKE,
+            capacity=28,
+            cost_per_km=7.27,
+            fixed_cost_per_vehicle=0,
+            min_utilization_threshold=0.5,
+            optimal_utilization_range=(0.6, 1.0),
+        ),
+        VehicleType.CARBOX: VehicleSpec(
+            VehicleType.CARBOX,
+            capacity=212,
+            cost_per_km=4.2,
+            fixed_cost_per_vehicle=0,
+            min_utilization_threshold=0.5,
+            optimal_utilization_range=(0.6, 1.0),
+        ),
+        VehicleType.BIG_BOX: VehicleSpec(
+            VehicleType.BIG_BOX,
+            capacity=44,
+            cost_per_km=7.95,
+            fixed_cost_per_vehicle=0,
+            min_utilization_threshold=0.5,
+            optimal_utilization_range=(0.6, 1.0),
+        ),
+    }
+
+    # Process data
+    processor = DataProcessor(default_parcel_size, proximity_threshold_meters)
+    config, pickup_terminals = processor.process_csv_data(
+        df, vehicle_specs, max_knock, time_window_hours
+    )
+
+    # Get summary
+    data_summary = processor.get_data_summary(pickup_terminals)
+
+    return config, pickup_terminals, data_summary
+
+
+def solve_from_csv(
+    csv_file_path: str,
+    max_knock: int = 4,
+    time_window_hours: float = 6.0,
+    default_parcel_size: int = 1,
+    proximity_threshold_meters: float = 100.0,
+    max_iterations: int = 1000,
+    distance_matrix_file: Optional[str] = None,
+    eta_matrix_file: Optional[str] = None,
+    average_speed_kmh: float = 25.0,
+) -> Dict:
+    """
+    Complete workflow: Load CSV data, solve VRP with OR-Tools optimization, return formatted results
+
+    Args:
+        csv_file_path: Path to CSV file with columns:
+                      - order_request_id, latitude, longitude, pickup_latitude, pickup_longitude
+        max_knock: Maximum knocks per pickup terminal
+        time_window_hours: Time window in hours
+        default_parcel_size: Default size for parcels
+        proximity_threshold_meters: Distance threshold to group pickup locations
+        max_iterations: ALNS iterations
+        distance_matrix_file: Optional path to custom distance matrix file
+        eta_matrix_file: Optional path to custom ETA matrix file
+        average_speed_kmh: Average vehicle speed for ETA calculation
+
+    Returns:
+        Formatted solution dictionary with OR-Tools optimization analysis
+    """
+    start_time = time.time()
+
+    # Load and process data
+    print("Loading and processing CSV data...")
+    config, pickup_terminals, data_summary = create_problem_from_csv(
+        csv_file_path,
+        max_knock,
+        time_window_hours,
+        default_parcel_size,
+        proximity_threshold_meters,
+    )
+
+    print("Data Summary:")
+    print(f"  - Pickup terminals: {data_summary['num_pickup_terminals']}")
+    print(f"  - Total parcels: {data_summary['total_parcels']}")
+    print(
+        f"  - Average parcels per terminal: {data_summary['avg_parcels_per_terminal']:.1f}"
+    )
+    print(
+        f"  - Time window: {time_window_hours:.1f} hours ({config.time_window_seconds} seconds)"
+    )
+    print(f"  - OR-Tools available: {ORTOOLS_AVAILABLE}")
+
+    # Build distance and ETA matrices
+    print("Building distance and ETA matrices...")
+    all_locations = []
+    for terminal in pickup_terminals:
+        all_locations.append((terminal.lat, terminal.lon))
+        for parcel in terminal.parcels:
+            all_locations.append(parcel.delivery_location)
+
+    # Remove duplicates
+    all_locations = list(set(all_locations))
+
+    # Load or build matrices
+    distance_matrix, eta_matrix = DistanceCalculator.load_custom_matrices(
+        distance_matrix_file, eta_matrix_file, all_locations
+    )
+
+    print(f"  - Matrix size: {len(all_locations)} x {len(all_locations)} locations")
+    print(f"  - Average speed: {average_speed_kmh} km/h")
+
+    # Solve
+    print(
+        "Solving VRP with ALNS, vehicle optimization, and OR-Tools route optimization..."
+    )
+    solver = ALNSSolver(config)
+    solution = solver.solve(
+        pickup_terminals, distance_matrix, eta_matrix, max_iterations
+    )
+
+    # Format output with all analysis
+    result = solver.format_output(solution, distance_matrix, eta_matrix)
+    result["processing_time"] = time.time() - start_time
+
+    # Add time analysis
+    time_analysis = solution.get_route_time_analysis()
+    result["time_analysis"] = time_analysis
+
+    # Add fleet cost analysis
+    vehicle_optimizer = VehicleOptimizer(config)
+    fleet_analysis = vehicle_optimizer.calculate_fleet_cost(
+        solution, distance_matrix, eta_matrix
+    )
+    result["fleet_analysis"] = fleet_analysis
+
+    return result
+
+
+def solve_from_csv_per_polygon(
+    df: pd.DataFrame,
+    max_knock: int = 4,
+    time_window_hours: float = 6.0,
+    default_parcel_size: int = 1,
+    proximity_threshold_meters: float = 100.0,
+    max_iterations: int = 1000,
+) -> Dict:
+    """
+    Complete workflow: Load CSV data, solve VRP, return formatted results
+
+    Args:
+        csv_file_path: Path to CSV file with columns:
+                      - order_request_id, latitude, longitude, pickup_latitude, pickup_longitude
+        max_knock: Maximum knocks per pickup terminal
+        time_window_hours: Time window in hours
+        default_parcel_size: Default size for parcels
+        proximity_threshold_meters: Distance threshold to group pickup locations
+        max_iterations: ALNS iterations
+
+    Returns:
+        Formatted solution dictionary
+    """
+    all_etas = {}
+    all_distances = {}
+    aggregated_results = {"polygon_results": {}}
+    for polygon_id, group in df.groupby(by="polygon_id"):
+        start_time = time.time()
+
+        # Load and process data
+        print("Loading and processing CSV data...")
+        config, pickup_terminals, data_summary = create_problem_from_csv(
+            group,
+            max_knock,
+            time_window_hours,
+            default_parcel_size,
+            proximity_threshold_meters,
+        )
+
+        print("Data Summary:")
+        print(f"  - Pickup terminals: {data_summary['num_pickup_terminals']}")
+        print(f"  - Total parcels: {data_summary['total_parcels']}")
+        print(
+            f"  - Average parcels per terminal: {data_summary['avg_parcels_per_terminal']:.1f}"
+        )
+
+        # Build distance matrix
+        print("Building distance matrix...")
+        all_locations = []
+        for terminal in pickup_terminals:
+            all_locations.append((terminal.lat, terminal.lon))
+            for parcel in terminal.parcels:
+                all_locations.append(parcel.delivery_location)
+
+        # Remove duplicates
+        all_locations = list(set(all_locations))
+        distance_matrix, eta_matrix = DistanceCalculator.build_matrices(all_locations)
+        all_etas.update(eta_matrix)
+        all_distances.update(distance_matrix)
+        # Solve
+        print("Solving VRP with ALNS...")
+        solver = ALNSSolver(config)
+        solution = solver.solve(
+            pickup_terminals, distance_matrix, eta_matrix, max_iterations
+        )
+
+        # Format output
+        result = solver.format_output(solution, distance_matrix, eta_matrix)
+        result["processing_time"] = time.time() - start_time
+        aggregated_results["polygon_results"][polygon_id] = result
+
+    visualize_vrp_solutions(
+        aggregated_results["polygon_results"], all_distances, all_etas
+    )
+
+    return aggregated_results
+
+
+if __name__ == "__main__":
+    df = pd.read_csv("./Sample_SDD 2.csv")
+
+    result = solve_from_csv_per_polygon(df, 2, 3, 4, 0, 200)
+    print(result)
