@@ -32,6 +32,8 @@ class OptimizationCache:
         self.failed_consolidations = set()
         self.successful_consolidations = {}
         self.time_window_violations = set()
+        self.solution_hashes = {}  # Track solution states
+        self.no_improvement_attempts = {}  # Track attempts that yield no improvement
         
     def add_failed_consolidation(self, terminal_id: int, route_sizes: tuple, vehicle_type: str):
         """Record a failed consolidation attempt"""
@@ -50,13 +52,45 @@ class OptimizationCache:
     def has_time_violation(self, route_signature: str) -> bool:
         """Check if this route signature has time violations"""
         return route_signature in self.time_window_violations
+    
+    def get_solution_hash(self, solution) -> str:
+        """Generate a hash for solution state"""
+        # Create a simplified hash based on routes and vehicle types
+        route_data = []
+        for route in solution.routes:
+            route_data.append((
+                route.vehicle_type.value,
+                route.total_size,
+                len(route.parcels),
+                tuple(route.pickup_sequence)
+            ))
+        return str(hash(tuple(sorted(route_data))))
+    
+    def is_solution_seen(self, solution) -> bool:
+        """Check if this solution state has been seen before"""
+        solution_hash = self.get_solution_hash(solution)
+        return solution_hash in self.solution_hashes
+    
+    def add_solution(self, solution):
+        """Add solution to seen solutions"""
+        solution_hash = self.get_solution_hash(solution)
+        self.solution_hashes[solution_hash] = True
+    
+    def add_no_improvement_attempt(self, operation_key: str):
+        """Record an operation that yielded no improvement"""
+        self.no_improvement_attempts[operation_key] = self.no_improvement_attempts.get(operation_key, 0) + 1
+    
+    def should_skip_operation(self, operation_key: str, max_attempts: int = 3) -> bool:
+        """Check if we should skip this operation due to repeated failures"""
+        return self.no_improvement_attempts.get(operation_key, 0) >= max_attempts
         
     def clear_cache(self):
         """Clear all cached data"""
         self.failed_consolidations.clear()
         self.successful_consolidations.clear()
         self.time_window_violations.clear()
-
+        self.solution_hashes.clear()
+        self.no_improvement_attempts.clear()
 
 
 class ALNSSolver:
@@ -68,6 +102,69 @@ class ALNSSolver:
         self.operators = ALNSOperators(config)
         self.random = random.Random(42)
 
+    def _should_try_vehicle_swap(self, solution: Solution) -> bool:
+        """Check if vehicle swap is worth attempting"""
+        if not hasattr(self.operators, 'vehicle_optimizer'):
+            return True
+        
+        # Skip if all routes are already using optimal vehicle types
+        optimal_count = 0
+        for route in solution.routes:
+            best_type = self.operators.vehicle_optimizer._get_best_vehicle_type_for_size(route.total_size)
+            if route.vehicle_type == best_type:
+                optimal_count += 1
+        
+        # Skip if >80% routes already optimal
+        if optimal_count / len(solution.routes) > 0.8:
+            return False
+        
+        return True
+
+    def _select_operator_intelligently(self, iteration: int, current_solution: Solution, 
+                                  consecutive_no_ops: int, vehicle_optimization_frequency: int,
+                                  instance_size: int) -> str:
+        """Intelligently select operator based on solution state"""
+        
+        # Skip expensive operations if they're unlikely to work
+        if len(current_solution.routes) == 1:
+            return "destroy_repair"  # Only useful operation for single route
+        
+        if consecutive_no_ops > 5:
+            return "destroy_repair"  # Fall back to exploration
+        
+        # Check if vehicle swap is worth trying
+        if not self._should_try_vehicle_swap(current_solution):
+            if len(current_solution.routes) > 1:
+                return "vehicle_consolidation"
+            else:
+                return "destroy_repair"
+        
+        # Instance-size based logic
+        if instance_size > 100:
+            # For large instances, reduce expensive vehicle operations
+            choice = self.random.random()
+            if choice < 0.5:
+                return "destroy_repair"
+            elif choice < 0.8:
+                if iteration % vehicle_optimization_frequency == 0:
+                    return "vehicle_consolidation"
+                else:
+                    return "skip"
+            else:
+                return "vehicle_swap"
+        else:
+            # Original logic for smaller instances
+            choice = self.random.random()
+            if choice < 0.3:
+                return "destroy_repair"
+            elif choice < 0.6:
+                if iteration % vehicle_optimization_frequency == 0:
+                    return "vehicle_consolidation"
+                else:
+                    return "vehicle_swap"
+            else:
+                return "destroy_repair"
+
     def solve_optimized(
         self,
         pickup_terminals: List[PickupTerminal],
@@ -75,21 +172,21 @@ class ALNSSolver:
         eta_matrix: Dict,
         max_iterations: int = 1000,
     ) -> Solution:
-        """Optimized solve method with performance improvements"""
+        """Optimized solve method with enhanced stagnation detection"""
         start_time = time.time()
         
         # Clear cache at start
         if hasattr(self.operators, 'vehicle_optimizer'):
             self.operators.vehicle_optimizer.optimization_cache.clear_cache()
         
-        # Reduce verbose logging for large instances
+        # Reduce verbose logging for larger instances
         instance_size = sum(len(terminal.parcels) for terminal in pickup_terminals)
-        verbose_logging = instance_size < 50  # Only verbose for small instances
+        verbose_logging = instance_size < 50
         
         if hasattr(self.operators, 'vehicle_optimizer'):
             self.operators.vehicle_optimizer.verbose_logging = verbose_logging
         
-        print(f"Starting optimization for {instance_size} parcels (verbose: {verbose_logging})")
+        print(f"Starting optimization for {instance_size} parcels")
         
         # Generate initial solution
         print("Generating initial solution...")
@@ -100,96 +197,92 @@ class ALNSSolver:
         # Apply initial vehicle optimization (once)
         print("Initial vehicle optimization...")
         try:
-            current_solution = self.operators.vehicle_consolidation_operator(
+            optimized_initial = self.operators.vehicle_consolidation_operator(
                 current_solution, distance_matrix, eta_matrix
             )
+            
+            # Check if initial optimization improved anything
+            if optimized_initial.total_cost < current_solution.total_cost * 0.99:  # 1% improvement threshold
+                current_solution = optimized_initial
+                print("Initial optimization improved solution")
+            else:
+                print("Initial optimization yielded minimal improvement")
+                
         except Exception as e:
             print(f"Warning: Initial vehicle optimization failed: {e}")
         
         best_solution = deepcopy(current_solution)
         self._print_solution_stats(current_solution, "Initial")
         
-        # Adaptive iteration limits based on instance size
+        # Adaptive parameters
         if instance_size > 100:
-            max_iterations = min(max_iterations, 200)  # Reduce iterations for large instances
-            vehicle_optimization_frequency = 100  # Less frequent vehicle optimization
+            max_iterations = min(max_iterations, 150)
+            vehicle_optimization_frequency = 150  # Very infrequent
+            stagnation_limit = 30
         elif instance_size > 50:
-            max_iterations = min(max_iterations, 500)
-            vehicle_optimization_frequency = 50
+            max_iterations = min(max_iterations, 300)
+            vehicle_optimization_frequency = 75
+            stagnation_limit = 50
         else:
             vehicle_optimization_frequency = 25
+            stagnation_limit = max_iterations // 6  # More generous for small instances
         
-        print(f"Running {max_iterations} iterations with vehicle optimization every {vehicle_optimization_frequency} iterations")
+        print(f"Running {max_iterations} iterations (stagnation limit: {stagnation_limit})")
         
-        # ALNS main loop with performance optimizations
+        # Enhanced stagnation tracking
         last_improvement = 0
-        stagnation_limit = max_iterations // 4  # Early termination
+        last_significant_improvement = 0  # Track major improvements
+        consecutive_no_ops = 0  # Track consecutive operations with no effect
+        solution_quality_history = [current_solution.total_cost]
         
         for iteration in range(max_iterations):
             try:
-                # Choose operator type (favor simpler operations for large instances)
-                operator_choice = self.random.random()
+                # SINGLE INTELLIGENT OPERATOR SELECTION
+                operator = self._select_operator_intelligently(
+                    iteration, current_solution, consecutive_no_ops, 
+                    vehicle_optimization_frequency, instance_size
+                )
                 
-                if instance_size > 100:
-                    # For large instances, reduce expensive vehicle operations
-                    if operator_choice < 0.4:  # More destroy-repair
-                        if self.random.random() < 0.5:
-                            destroyed = self.operators.random_removal(current_solution)
-                        else:
-                            destroyed = self.operators.terminal_removal(current_solution)
-                        repaired = self.operators.greedy_insertion(
-                            destroyed, distance_matrix, eta_matrix
-                        )
-                    elif operator_choice < 0.7:  # Some vehicle optimization
-                        if iteration % vehicle_optimization_frequency == 0:
-                            repaired = self.operators.vehicle_consolidation_operator(
-                                current_solution, distance_matrix, eta_matrix
-                            )
-                        else:
-                            # Skip expensive operation
-                            continue
-                    else:  # Simpler operations
-                        repaired = self.operators.vehicle_type_swap_operator(
-                            current_solution, distance_matrix, eta_matrix
-                        )
-                else:
-                    # Original logic for smaller instances
-                    if operator_choice < 0.25:
-                        if self.random.random() < 0.5:
-                            destroyed = self.operators.random_removal(current_solution)
-                        else:
-                            destroyed = self.operators.terminal_removal(current_solution)
-                        repaired = self.operators.greedy_insertion(
-                            destroyed, distance_matrix, eta_matrix
-                        )
-                    elif operator_choice < 0.5:
-                        if self.random.random() < 0.4:
-                            repaired = self.operators.vehicle_consolidation_operator(
-                                current_solution, distance_matrix, eta_matrix
-                            )
-                        elif self.random.random() < 0.7:
-                            repaired = self.operators.vehicle_type_swap_operator(
-                                current_solution, distance_matrix, eta_matrix
-                            )
-                        else:
-                            repaired = self.operators.route_splitting_operator(
-                                current_solution, distance_matrix, eta_matrix
-                            )
+                repaired = None
+                
+                if operator == "destroy_repair":
+                    if self.random.random() < 0.5:
+                        destroyed = self.operators.random_removal(current_solution)
                     else:
-                        if self.random.random() < 0.5:
-                            destroyed = self.operators.random_removal(current_solution)
-                        else:
-                            destroyed = self.operators.terminal_removal(current_solution)
-                        repaired = self.operators.greedy_insertion(
-                            destroyed, distance_matrix, eta_matrix
-                        )
-                        if iteration % vehicle_optimization_frequency == 0:
-                            repaired = self.operators.vehicle_consolidation_operator(
-                                repaired, distance_matrix, eta_matrix
-                            )
+                        destroyed = self.operators.terminal_removal(current_solution)
+                    repaired = self.operators.greedy_insertion(
+                        destroyed, distance_matrix, eta_matrix
+                    )
+                    
+                elif operator == "vehicle_consolidation":
+                    repaired = self.operators.vehicle_consolidation_operator(
+                        current_solution, distance_matrix, eta_matrix
+                    )
+                    
+                elif operator == "vehicle_swap":
+                    repaired = self.operators.vehicle_type_swap_operator(
+                        current_solution, distance_matrix, eta_matrix
+                    )
+                
+                elif operator == "skip":
+                    continue  # Skip this iteration
                 
                 if repaired is None:
+                    consecutive_no_ops += 1
                     continue
+                
+                # Check if solution actually changed
+                if self._solutions_are_equivalent(current_solution, repaired):
+                    consecutive_no_ops += 1
+                    if consecutive_no_ops > 10:
+                        print(f"Iteration {iteration}: Too many no-ops, trying diversification")
+                        # Force diversification
+                        diversified = self.operators.random_removal(current_solution, removal_rate=0.5)
+                        repaired = self.operators.greedy_insertion(diversified, distance_matrix, eta_matrix)
+                    continue
+                
+                # Reset no-op counter if we got a different solution
+                consecutive_no_ops = 0
                 
                 # Evaluate solution
                 repaired.calculate_cost_and_time(distance_matrix, eta_matrix)
@@ -199,27 +292,46 @@ class ALNSSolver:
                     and repaired.validate_time_window(self.config.time_window_seconds)
                 )
                 
-                # Acceptance criterion
+                # Enhanced acceptance criterion
+                improvement_threshold = 0.01  # 1% improvement threshold
+                significant_improvement_threshold = 0.05  # 5% for significant improvement
+                
                 if repaired.is_feasible and (
                     not best_solution.is_feasible or repaired.total_cost < best_solution.total_cost
                 ):
+                    improvement = (best_solution.total_cost - repaired.total_cost) / best_solution.total_cost
+                    
                     best_solution = deepcopy(repaired)
                     current_solution = repaired
                     last_improvement = iteration
                     
-                    if verbose_logging or iteration % 50 == 0:  # Reduced logging frequency
+                    if improvement > significant_improvement_threshold:
+                        last_significant_improvement = iteration
+                        print(f"Iteration {iteration}: Significant improvement ({improvement*100:.1f}%)")
                         self._print_solution_stats(best_solution, f"Iteration {iteration}")
-                
-                elif repaired.is_feasible and repaired.total_cost < current_solution.total_cost * 1.05:
+                    elif improvement > improvement_threshold:
+                        if verbose_logging or iteration % 25 == 0:
+                            print(f"Iteration {iteration}: Minor improvement ({improvement*100:.1f}%)")
+                    
+                    solution_quality_history.append(repaired.total_cost)
+                    
+                elif repaired.is_feasible and repaired.total_cost < current_solution.total_cost * 1.02:
                     current_solution = repaired
-                elif self.random.random() < 0.02:  # Reduced diversification
+                elif self.random.random() < 0.01:  # Very rare diversification
                     current_solution = repaired
                 
-                # Early termination
+                # Enhanced early termination logic
                 if iteration - last_improvement > stagnation_limit:
                     print(f"Early termination: No improvement for {iteration - last_improvement} iterations")
                     break
-                    
+                
+                # Check for solution quality plateau
+                if len(solution_quality_history) > 20:
+                    recent_variance = max(solution_quality_history[-10:]) - min(solution_quality_history[-10:])
+                    if recent_variance < best_solution.total_cost * 0.001:  # Less than 0.1% variance
+                        print(f"Early termination: Solution quality plateaued")
+                        break
+                        
             except Exception as e:
                 if verbose_logging:
                     print(f"Iteration {iteration}: Error: {e}")
@@ -228,8 +340,8 @@ class ALNSSolver:
         processing_time = time.time() - start_time
         print(f"Completed in {processing_time:.2f} seconds")
         
-        # Final optimization (simplified for large instances)
-        if best_solution.is_feasible and instance_size < 100:
+        # Skip final optimization if we're already optimal
+        if best_solution.is_feasible and len(best_solution.routes) > 1 and instance_size < 75:
             print("Final vehicle optimization...")
             try:
                 final_optimized = self.operators.vehicle_consolidation_operator(
@@ -237,9 +349,253 @@ class ALNSSolver:
                 )
                 final_optimized.calculate_cost_and_time(distance_matrix, eta_matrix)
                 
-                if final_optimized.is_feasible and final_optimized.total_cost < best_solution.total_cost:
+                if final_optimized.is_feasible and final_optimized.total_cost < best_solution.total_cost * 0.99:
                     best_solution = final_optimized
                     print("Final optimization improved solution")
+                else:
+                    print("Final optimization yielded minimal improvement")
+            except Exception as e:
+                print(f"Final optimization failed: {e}")
+        
+        self._print_final_stats(best_solution)
+        return best_solution
+
+    def _solutions_are_equivalent(self, solution1: Solution, solution2: Solution) -> bool:
+        """Check if two solutions are equivalent"""
+        if len(solution1.routes) != len(solution2.routes):
+            return False
+        
+        # Quick check: same total cost within small tolerance
+        if abs(solution1.total_cost - solution2.total_cost) < 0.01:
+            return True
+        
+        return False
+
+    def solve_optimized_old(
+        self,
+        pickup_terminals: List[PickupTerminal],
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+        max_iterations: int = 1000,
+    ) -> Solution:
+        """Optimized solve method with enhanced stagnation detection"""
+        start_time = time.time()
+        
+        # Clear cache at start
+        if hasattr(self.operators, 'vehicle_optimizer'):
+            self.operators.vehicle_optimizer.optimization_cache.clear_cache()
+        
+        # Reduce verbose logging for larger instances
+        instance_size = sum(len(terminal.parcels) for terminal in pickup_terminals)
+        verbose_logging = instance_size < 50
+        
+        if hasattr(self.operators, 'vehicle_optimizer'):
+            self.operators.vehicle_optimizer.verbose_logging = verbose_logging
+        
+        print(f"Starting optimization for {instance_size} parcels")
+        
+        # Generate initial solution
+        print("Generating initial solution...")
+        current_solution = self.constructor.greedy_construction(
+            pickup_terminals, distance_matrix, eta_matrix
+        )
+        
+        # Apply initial vehicle optimization (once)
+        print("Initial vehicle optimization...")
+        try:
+            optimized_initial = self.operators.vehicle_consolidation_operator(
+                current_solution, distance_matrix, eta_matrix
+            )
+            
+            # Check if initial optimization improved anything
+            if optimized_initial.total_cost < current_solution.total_cost * 0.99:  # 1% improvement threshold
+                current_solution = optimized_initial
+                print("Initial optimization improved solution")
+            else:
+                print("Initial optimization yielded minimal improvement")
+                
+        except Exception as e:
+            print(f"Warning: Initial vehicle optimization failed: {e}")
+        
+        best_solution = deepcopy(current_solution)
+        self._print_solution_stats(current_solution, "Initial")
+        
+        # Adaptive parameters
+        if instance_size > 100:
+            max_iterations = min(max_iterations, 150)
+            vehicle_optimization_frequency = 150  # Very infrequent
+            stagnation_limit = 30
+        elif instance_size > 50:
+            max_iterations = min(max_iterations, 300)
+            vehicle_optimization_frequency = 75
+            stagnation_limit = 50
+        else:
+            vehicle_optimization_frequency = 25
+            stagnation_limit = max_iterations // 6  # More generous for small instances
+        
+        print(f"Running {max_iterations} iterations (stagnation limit: {stagnation_limit})")
+        
+        # Enhanced stagnation tracking
+        last_improvement = 0
+        last_significant_improvement = 0  # Track major improvements
+        consecutive_no_ops = 0  # Track consecutive operations with no effect
+        solution_quality_history = [current_solution.total_cost]
+        
+        for iteration in range(max_iterations):
+            try:
+                # Skip expensive operations if we're stagnating
+                if consecutive_no_ops > 5:
+                    operation_choice = self.random.random()
+                    if operation_choice < 0.8:  # Favor simple operations
+                        if self.random.random() < 0.5:
+                            destroyed = self.operators.random_removal(current_solution)
+                        else:
+                            destroyed = self.operators.terminal_removal(current_solution)
+                        repaired = self.operators.greedy_insertion(
+                            destroyed, distance_matrix, eta_matrix
+                        )
+                    else:
+                        continue  # Skip iteration
+                else:
+                    # Normal operation selection
+                    operator_choice = self.random.random()
+                    
+                    if instance_size > 100:
+                        # For large instances, reduce expensive vehicle operations
+                        if operator_choice < 0.5:
+                            if self.random.random() < 0.5:
+                                destroyed = self.operators.random_removal(current_solution)
+                            else:
+                                destroyed = self.operators.terminal_removal(current_solution)
+                            repaired = self.operators.greedy_insertion(
+                                destroyed, distance_matrix, eta_matrix
+                            )
+                        elif operator_choice < 0.8:
+                            if iteration % vehicle_optimization_frequency == 0:
+                                repaired = self.operators.vehicle_consolidation_operator(
+                                    current_solution, distance_matrix, eta_matrix
+                                )
+                            else:
+                                continue
+                        else:
+                            repaired = self.operators.vehicle_type_swap_operator(
+                                current_solution, distance_matrix, eta_matrix
+                            )
+                    else:
+                        # Original logic for smaller instances
+                        if operator_choice < 0.3:
+                            if self.random.random() < 0.5:
+                                destroyed = self.operators.random_removal(current_solution)
+                            else:
+                                destroyed = self.operators.terminal_removal(current_solution)
+                            repaired = self.operators.greedy_insertion(
+                                destroyed, distance_matrix, eta_matrix
+                            )
+                        elif operator_choice < 0.6:
+                            if iteration % vehicle_optimization_frequency == 0:
+                                repaired = self.operators.vehicle_consolidation_operator(
+                                    current_solution, distance_matrix, eta_matrix
+                                )
+                            else:
+                                repaired = self.operators.vehicle_type_swap_operator(
+                                    current_solution, distance_matrix, eta_matrix
+                                )
+                        else:
+                            if self.random.random() < 0.5:
+                                destroyed = self.operators.random_removal(current_solution)
+                            else:
+                                destroyed = self.operators.terminal_removal(current_solution)
+                            repaired = self.operators.greedy_insertion(
+                                destroyed, distance_matrix, eta_matrix
+                            )
+                
+                if repaired is None:
+                    consecutive_no_ops += 1
+                    continue
+                
+                # Check if solution actually changed
+                if self._solutions_are_equivalent(current_solution, repaired):
+                    consecutive_no_ops += 1
+                    if consecutive_no_ops > 10:
+                        print(f"Iteration {iteration}: Too many no-ops, trying diversification")
+                        # Force diversification
+                        diversified = self.operators.random_removal(current_solution, removal_rate=0.5)
+                        repaired = self.operators.greedy_insertion(diversified, distance_matrix, eta_matrix)
+                    continue
+                
+                # Reset no-op counter if we got a different solution
+                consecutive_no_ops = 0
+                
+                # Evaluate solution
+                repaired.calculate_cost_and_time(distance_matrix, eta_matrix)
+                repaired.is_feasible = (
+                    len(repaired.unassigned_parcels) == 0
+                    and repaired.validate_knock_constraints(self.config.max_knock)
+                    and repaired.validate_time_window(self.config.time_window_seconds)
+                )
+                
+                # Enhanced acceptance criterion
+                improvement_threshold = 0.01  # 1% improvement threshold
+                significant_improvement_threshold = 0.05  # 5% for significant improvement
+                
+                if repaired.is_feasible and (
+                    not best_solution.is_feasible or repaired.total_cost < best_solution.total_cost
+                ):
+                    improvement = (best_solution.total_cost - repaired.total_cost) / best_solution.total_cost
+                    
+                    best_solution = deepcopy(repaired)
+                    current_solution = repaired
+                    last_improvement = iteration
+                    
+                    if improvement > significant_improvement_threshold:
+                        last_significant_improvement = iteration
+                        print(f"Iteration {iteration}: Significant improvement ({improvement*100:.1f}%)")
+                        self._print_solution_stats(best_solution, f"Iteration {iteration}")
+                    elif improvement > improvement_threshold:
+                        if verbose_logging or iteration % 25 == 0:
+                            print(f"Iteration {iteration}: Minor improvement ({improvement*100:.1f}%)")
+                    
+                    solution_quality_history.append(repaired.total_cost)
+                    
+                elif repaired.is_feasible and repaired.total_cost < current_solution.total_cost * 1.02:
+                    current_solution = repaired
+                elif self.random.random() < 0.01:  # Very rare diversification
+                    current_solution = repaired
+                
+                # Enhanced early termination logic
+                if iteration - last_improvement > stagnation_limit:
+                    print(f"Early termination: No improvement for {iteration - last_improvement} iterations")
+                    break
+                
+                # Check for solution quality plateau
+                if len(solution_quality_history) > 20:
+                    recent_variance = max(solution_quality_history[-10:]) - min(solution_quality_history[-10:])
+                    if recent_variance < best_solution.total_cost * 0.001:  # Less than 0.1% variance
+                        print(f"Early termination: Solution quality plateaued")
+                        break
+                        
+            except Exception as e:
+                if verbose_logging:
+                    print(f"Iteration {iteration}: Error: {e}")
+                continue
+        
+        processing_time = time.time() - start_time
+        print(f"Completed in {processing_time:.2f} seconds")
+        
+        # Skip final optimization if we're already optimal
+        if best_solution.is_feasible and len(best_solution.routes) > 1 and instance_size < 75:
+            print("Final vehicle optimization...")
+            try:
+                final_optimized = self.operators.vehicle_consolidation_operator(
+                    best_solution, distance_matrix, eta_matrix
+                )
+                final_optimized.calculate_cost_and_time(distance_matrix, eta_matrix)
+                
+                if final_optimized.is_feasible and final_optimized.total_cost < best_solution.total_cost * 0.99:
+                    best_solution = final_optimized
+                    print("Final optimization improved solution")
+                else:
+                    print("Final optimization yielded minimal improvement")
             except Exception as e:
                 print(f"Final optimization failed: {e}")
         
@@ -1277,8 +1633,167 @@ class VehicleOptimizer:
         self.config = config
         self.vehicle_specs = config.vehicle_specs
         self.route_optimizer = ORToolsRouteOptimizer(config)
-        self.optimization_cache = OptimizationCache()  # Add cache
-        self.verbose_logging = False 
+        self.optimization_cache = OptimizationCache()  # Use enhanced cache
+        self.verbose_logging = False
+
+    def _solutions_are_equivalent(self, solution1: Solution, solution2: Solution) -> bool:
+        """Check if two solutions are equivalent"""
+        if len(solution1.routes) != len(solution2.routes):
+            return False
+        
+        # Quick check: same total cost within small tolerance
+        if abs(solution1.total_cost - solution2.total_cost) < 0.01:
+            return True
+        
+        return False
+
+    def optimize_vehicle_assignments_with_stagnation_detection(
+        self, solution: Solution, distance_matrix: Dict, eta_matrix: Dict
+    ) -> Solution:
+        """Globally optimize vehicle type assignments with stagnation detection"""
+        
+        # Quick exit for single route scenarios
+        if len(solution.routes) <= 1:
+            if self.verbose_logging:
+                print(f"Skipping vehicle optimization: only {len(solution.routes)} route(s)")
+            return solution
+        
+        # Check if we've seen this solution before
+        if self.optimization_cache.is_solution_seen(solution):
+            if self.verbose_logging:
+                print("Skipping vehicle optimization: solution already processed")
+            return solution
+        
+        # Record this solution
+        self.optimization_cache.add_solution(solution)
+        
+        new_solution = deepcopy(solution)
+        original_cost = solution.total_cost
+        
+        if self.verbose_logging:
+            print(f"Starting vehicle optimization with {len(new_solution.routes)} routes")
+
+        # Group routes by pickup terminals for consolidation opportunities
+        terminal_routes = self._group_routes_by_terminals(new_solution.routes)
+        
+        improved_routes = []
+        any_improvement = False
+
+        for terminal_id, routes in terminal_routes.items():
+            operation_key = f"terminal_{terminal_id}_{len(routes)}_routes"
+            
+            # Skip if we've tried this operation too many times without improvement
+            if self.optimization_cache.should_skip_operation(operation_key):
+                if self.verbose_logging:
+                    print(f"Skipping terminal {terminal_id}: too many failed attempts")
+                improved_routes.extend(routes)
+                continue
+            
+            if self.verbose_logging:
+                print(f"Optimizing terminal {terminal_id} with {len(routes)} routes")
+            
+            if len(routes) == 1:
+                # Single route - check if optimization is worth it
+                route = routes[0]
+                
+                # Skip if route is already well-optimized
+                if self._is_route_well_optimized(route):
+                    if self.verbose_logging:
+                        print(f"  Skipping single route: already well-optimized")
+                    improved_routes.extend(routes)
+                    continue
+                
+                if self.verbose_logging:
+                    print(f"  Single route optimization")
+                optimized = self._optimize_single_route_vehicle(
+                    route, distance_matrix, eta_matrix
+                )
+                
+                # Check if optimization actually improved anything
+                if self._routes_are_equivalent(routes, optimized):
+                    self.optimization_cache.add_no_improvement_attempt(operation_key)
+                    if self.verbose_logging:
+                        print(f"  No improvement from single route optimization")
+                else:
+                    any_improvement = True
+                    
+                improved_routes.extend(optimized)
+            else:
+                # Multiple routes - try consolidation
+                if self.verbose_logging:
+                    print(f"  Multi-route consolidation")
+                optimized = self._optimize_multi_route_consolidation_optimized(
+                    routes, terminal_id, distance_matrix, eta_matrix
+                )
+                
+                # Check if consolidation actually improved anything
+                if self._routes_are_equivalent(routes, optimized):
+                    self.optimization_cache.add_no_improvement_attempt(operation_key)
+                    if self.verbose_logging:
+                        print(f"  No improvement from consolidation")
+                else:
+                    any_improvement = True
+                    
+                improved_routes.extend(optimized)
+
+        new_solution.routes = improved_routes
+        new_solution._rebuild_assignments()
+        
+        # Calculate new cost to verify improvement
+        new_solution.calculate_cost_and_time(distance_matrix, eta_matrix)
+        
+        improvement_pct = ((original_cost - new_solution.total_cost) / original_cost) * 100 if original_cost > 0 else 0
+        
+        if self.verbose_logging or improvement_pct > 1:  # Only log significant improvements
+            print(f"Vehicle optimization complete: {len(solution.routes)} -> {len(new_solution.routes)} routes")
+            if improvement_pct > 1:
+                print(f"Cost improvement: {improvement_pct:.1f}%")
+        
+        return new_solution
+
+    def _is_route_well_optimized(self, route: Route) -> bool:
+        """Check if a route is already well-optimized"""
+        # Check utilization
+        utilization = route.total_size / route.vehicle_spec.capacity
+        
+        # Well-optimized criteria
+        return (
+            route.is_optimized and  # Already OR-Tools optimized
+            0.6 <= utilization <= 1.0 and  # Good utilization
+            route.is_time_feasible(self.config.time_window_seconds) and  # Time feasible
+            route.vehicle_type == self._get_best_vehicle_type_for_size(route.total_size)  # Optimal vehicle type
+        )
+
+    def _get_best_vehicle_type_for_size(self, total_size: int) -> VehicleType:
+        """Get the most cost-effective vehicle type for given size"""
+        best_type = None
+        best_cost_efficiency = float("inf")
+        
+        for vehicle_type, spec in self.vehicle_specs.items():
+            if spec.capacity >= total_size:
+                cost_efficiency = spec.cost_per_km / spec.capacity
+                if cost_efficiency < best_cost_efficiency:
+                    best_cost_efficiency = cost_efficiency
+                    best_type = vehicle_type
+        
+        return best_type or VehicleType.CARBOX 
+
+    def _routes_are_equivalent(self, routes1: List[Route], routes2: List[Route]) -> bool:
+        """Check if two route lists are equivalent"""
+        if len(routes1) != len(routes2):
+            return False
+        
+        # Sort routes by vehicle_id for comparison
+        sorted_routes1 = sorted(routes1, key=lambda r: r.vehicle_id)
+        sorted_routes2 = sorted(routes2, key=lambda r: r.vehicle_id)
+        
+        for r1, r2 in zip(sorted_routes1, sorted_routes2):
+            if (r1.vehicle_type != r2.vehicle_type or 
+                r1.total_size != r2.total_size or
+                len(r1.parcels) != len(r2.parcels)):
+                return False
+        
+        return True
 
     def _try_consolidation_with_vehicle_optimized(
         self,
@@ -1558,41 +2073,106 @@ class VehicleOptimizer:
         
         return best_combination
 
-    def optimize_vehicle_assignments(
-        self, solution: Solution, distance_matrix: Dict, eta_matrix: Dict
-    ) -> Solution:
-        """Globally optimize vehicle type assignments with route optimization"""
+    def optimize_vehicle_assignments(self, solution: Solution, distance_matrix: Dict, eta_matrix: Dict) -> Solution:
+        """Globally optimize vehicle type assignments with stagnation detection"""
+        
+        # Quick exit for single route scenarios
+        if len(solution.routes) <= 1:
+            if self.verbose_logging:
+                print(f"Skipping vehicle optimization: only {len(solution.routes)} route(s)")
+            return solution
+        
+        # Check if we've seen this solution before
+        if self.optimization_cache.is_solution_seen(solution):
+            if self.verbose_logging:
+                print("Skipping vehicle optimization: solution already processed")
+            return solution
+        
+        # Record this solution
+        self.optimization_cache.add_solution(solution)
+        
         new_solution = deepcopy(solution)
-
-        print(f"Starting vehicle optimization with {len(new_solution.routes)} routes")
+        original_cost = solution.total_cost
+        
+        if self.verbose_logging:
+            print(f"Starting vehicle optimization with {len(new_solution.routes)} routes")
 
         # Group routes by pickup terminals for consolidation opportunities
         terminal_routes = self._group_routes_by_terminals(new_solution.routes)
-
+        
         improved_routes = []
+        any_improvement = False
 
         for terminal_id, routes in terminal_routes.items():
-            print(f"\nOptimizing terminal {terminal_id} with {len(routes)} routes")
+            operation_key = f"terminal_{terminal_id}_{len(routes)}_routes"
+            
+            # Skip if we've tried this operation too many times without improvement
+            if self.optimization_cache.should_skip_operation(operation_key):
+                if self.verbose_logging:
+                    print(f"Skipping terminal {terminal_id}: too many failed attempts")
+                improved_routes.extend(routes)
+                continue
+            
+            if self.verbose_logging:
+                print(f"Optimizing terminal {terminal_id} with {len(routes)} routes")
             
             if len(routes) == 1:
-                # Single route - optimize vehicle type and sequence
-                print(f"  Single route optimization")
+                # Single route - check if optimization is worth it
+                route = routes[0]
+                
+                # Skip if route is already well-optimized
+                if self._is_route_well_optimized(route):
+                    if self.verbose_logging:
+                        print(f"  Skipping single route: already well-optimized")
+                    improved_routes.extend(routes)
+                    continue
+                
+                if self.verbose_logging:
+                    print(f"  Single route optimization")
                 optimized = self._optimize_single_route_vehicle(
-                    routes[0], distance_matrix, eta_matrix
+                    route, distance_matrix, eta_matrix
                 )
+                
+                # Check if optimization actually improved anything
+                if self._routes_are_equivalent(routes, optimized):
+                    self.optimization_cache.add_no_improvement_attempt(operation_key)
+                    if self.verbose_logging:
+                        print(f"  No improvement from single route optimization")
+                else:
+                    any_improvement = True
+                    
                 improved_routes.extend(optimized)
             else:
                 # Multiple routes - try consolidation
-                print(f"  Multi-route consolidation")
-                optimized = self._optimize_multi_route_consolidation(
+                if self.verbose_logging:
+                    print(f"  Multi-route consolidation")
+                optimized = self._optimize_multi_route_consolidation_optimized(
                     routes, terminal_id, distance_matrix, eta_matrix
                 )
+                
+                # Check if consolidation actually improved anything
+                if self._routes_are_equivalent(routes, optimized):
+                    self.optimization_cache.add_no_improvement_attempt(operation_key)
+                    if self.verbose_logging:
+                        print(f"  No improvement from consolidation")
+                else:
+                    any_improvement = True
+                    
                 improved_routes.extend(optimized)
 
         new_solution.routes = improved_routes
         new_solution._rebuild_assignments()
         
-        print(f"Vehicle optimization complete: {len(solution.routes)} -> {len(new_solution.routes)} routes")
+        # Calculate new cost to verify improvement
+        new_solution.calculate_cost_and_time(distance_matrix, eta_matrix)
+        
+        improvement_pct = ((original_cost - new_solution.total_cost) / original_cost) * 100 if original_cost > 0 else 0
+        
+        if self.verbose_logging or improvement_pct > 1:  # Only log significant improvements
+            print(f"Vehicle optimization complete: {len(solution.routes)} -> {len(new_solution.routes)} routes")
+            if improvement_pct > 1:
+                print(f"Cost improvement: {improvement_pct:.1f}%")
+        
         return new_solution
 
     def _group_routes_by_terminals(self, routes: List[Route]) -> Dict[int, List[Route]]:
@@ -2219,12 +2799,29 @@ class ALNSOperators:
         self.vehicle_optimizer = VehicleOptimizer(config)
         self.route_optimizer = ORToolsRouteOptimizer(config)
 
+    def _should_try_vehicle_swap(self, solution: Solution) -> bool:
+        """Check if vehicle swap is worth attempting"""
+        # Skip if all routes are already using optimal vehicle types
+        optimal_count = 0
+        for route in solution.routes:
+            best_type = self.vehicle_optimizer._get_best_vehicle_type_for_size(route.total_size)
+            if route.vehicle_type == best_type:
+                optimal_count += 1
+        
+        # Skip if >80% routes already optimal
+        if optimal_count / len(solution.routes) > 0.8:
+            if self.vehicle_optimizer.verbose_logging:
+                print("Skipping vehicle swap: most routes already optimal")
+            return False
+        
+        return True
+
     # Vehicle Type Optimization Operators
     def vehicle_consolidation_operator(
         self, solution: Solution, distance_matrix: Dict, eta_matrix: Dict
     ) -> Solution:
         """Try to consolidate routes using larger vehicles with OR-Tools optimization"""
-        return self.vehicle_optimizer.optimize_vehicle_assignments(
+        return self.vehicle_optimizer.optimize_vehicle_assignments_with_stagnation_detection(
             solution, distance_matrix, eta_matrix
         )
 
@@ -2235,7 +2832,7 @@ class ALNSOperators:
         eta_matrix: Dict,
         num_swaps: int = 2,
     ) -> Solution:
-        """Randomly swap vehicle types for routes with OR-Tools optimization"""
+        """Optimized vehicle type swap with early capacity filtering"""
         new_solution = deepcopy(solution)
 
         if not new_solution.routes:
@@ -2247,31 +2844,48 @@ class ALNSOperators:
         )
 
         for route in routes_to_modify:
-            # Try different vehicle types
             original_type = route.vehicle_type
             original_spec = route.vehicle_spec
             
-            available_types = [
-                vt for vt in self.config.vehicle_specs.keys() if vt != original_type
-            ]
-
-            if not available_types:
+            # PRE-FILTER: Only test vehicle types that can fit the route
+            feasible_types = []
+            for vt, spec in self.config.vehicle_specs.items():
+                if vt != original_type and spec.capacity >= route.total_size:
+                    feasible_types.append((vt, spec))
+            
+            if not feasible_types:
+                if self.vehicle_optimizer.verbose_logging:
+                    print(f"  Skipping route {route.vehicle_id}: no feasible vehicle types")
                 continue
 
-            # Try random vehicle type
-            new_type = self.random.choice(available_types)
-            new_spec = self.config.vehicle_specs[new_type]
-
-            # CRITICAL: Check capacity constraint before swapping
-            if not self._validate_route_before_creation(route.parcels, new_spec):
-                continue  # Skip this swap if capacity insufficient
+            # Sort by cost efficiency (try cheapest first)
+            feasible_types.sort(key=lambda x: x[1].cost_per_km / x[1].capacity)
+            
+            # Try only the most promising vehicle type (not all types)
+            new_type, new_spec = feasible_types[0]
+            
+            if self.vehicle_optimizer.verbose_logging:
+                print(f"  Testing {original_type.value} → {new_type.value} for route {route.vehicle_id}")
 
             try:
                 # Update vehicle type
                 route.vehicle_type = new_type
                 route.vehicle_spec = new_spec
 
-                # Optimize route sequence with OR-Tools
+                # Quick time estimate before expensive OR-Tools call
+                estimated_duration = self.vehicle_optimizer._estimate_route_duration(
+                    route, distance_matrix, eta_matrix
+                )
+                
+                if estimated_duration > self.config.time_window_seconds * 1.1:
+                    if self.vehicle_optimizer.verbose_logging:
+                        print(f"  Skipping {new_type.value}: estimated time violation")
+                    # Revert and skip
+                    route.vehicle_type = original_type
+                    route.vehicle_spec = original_spec
+                    continue
+
+                # Only now call expensive OR-Tools optimization
                 optimized_route = self.route_optimizer.optimize_route_sequence(
                     route, distance_matrix, eta_matrix
                 )
@@ -2287,15 +2901,20 @@ class ALNSOperators:
                     )
                 )
 
-                # Revert if time constraint violated
+                # Final time constraint check
                 if not route.is_time_feasible(self.config.time_window_seconds):
-                    print(f"Reverting vehicle swap: time window violated")
+                    if self.vehicle_optimizer.verbose_logging:
+                        print(f"  Reverting {new_type.value}: time window violated")
                     route.vehicle_type = original_type
                     route.vehicle_spec = original_spec
                     route.is_optimized = False
-                    
+                else:
+                    if self.vehicle_optimizer.verbose_logging:
+                        print(f"  Successfully swapped to {new_type.value}")
+                        
             except Exception as e:
-                print(f"Error in vehicle type swap: {e}")
+                if self.vehicle_optimizer.verbose_logging:
+                    print(f"  Error swapping to {new_type.value}: {e}")
                 # Revert to original
                 route.vehicle_type = original_type
                 route.vehicle_spec = original_spec
@@ -2846,104 +3465,6 @@ def create_problem_from_csv(
     return config, pickup_terminals, data_summary
 
 
-def solve_from_csv(
-    csv_file_path: str,
-    max_knock: int = 4,
-    time_window_hours: float = 6.0,
-    default_parcel_size: int = 1,
-    proximity_threshold_meters: float = 100.0,
-    max_iterations: int = 1000,
-    distance_matrix_file: Optional[str] = None,
-    eta_matrix_file: Optional[str] = None,
-    average_speed_kmh: float = 25.0,
-) -> Dict:
-    """
-    Complete workflow: Load CSV data, solve VRP with OR-Tools optimization, return formatted results
-
-    Args:
-        csv_file_path: Path to CSV file with columns:
-                      - order_request_id, latitude, longitude, pickup_latitude, pickup_longitude
-        max_knock: Maximum knocks per pickup terminal
-        time_window_hours: Time window in hours
-        default_parcel_size: Default size for parcels
-        proximity_threshold_meters: Distance threshold to group pickup locations
-        max_iterations: ALNS iterations
-        distance_matrix_file: Optional path to custom distance matrix file
-        eta_matrix_file: Optional path to custom ETA matrix file
-        average_speed_kmh: Average vehicle speed for ETA calculation
-
-    Returns:
-        Formatted solution dictionary with OR-Tools optimization analysis
-    """
-    start_time = time.time()
-
-    # Load and process data
-    print("Loading and processing CSV data...")
-    config, pickup_terminals, data_summary = create_problem_from_csv(
-        csv_file_path,
-        max_knock,
-        time_window_hours,
-        default_parcel_size,
-        proximity_threshold_meters,
-    )
-
-    print("Data Summary:")
-    print(f"  - Pickup terminals: {data_summary['num_pickup_terminals']}")
-    print(f"  - Total parcels: {data_summary['total_parcels']}")
-    print(
-        f"  - Average parcels per terminal: {data_summary['avg_parcels_per_terminal']:.1f}"
-    )
-    print(
-        f"  - Time window: {time_window_hours:.1f} hours ({config.time_window_seconds} seconds)"
-    )
-    print(f"  - OR-Tools available: {ORTOOLS_AVAILABLE}")
-
-    # Build distance and ETA matrices
-    print("Building distance and ETA matrices...")
-    all_locations = []
-    for terminal in pickup_terminals:
-        all_locations.append((terminal.lat, terminal.lon))
-        for parcel in terminal.parcels:
-            all_locations.append(parcel.delivery_location)
-
-    # Remove duplicates
-    all_locations = list(set(all_locations))
-
-    # Load or build matrices
-    distance_matrix, eta_matrix = DistanceCalculator.load_custom_matrices(
-        distance_matrix_file, eta_matrix_file, all_locations
-    )
-
-    print(f"  - Matrix size: {len(all_locations)} x {len(all_locations)} locations")
-    print(f"  - Average speed: {average_speed_kmh} km/h")
-
-    # Solve
-    print(
-        "Solving VRP with ALNS, vehicle optimization, and OR-Tools route optimization..."
-    )
-    solver = ALNSSolver(config)
-    solution = solver.solve_with_error_handling(
-        pickup_terminals, distance_matrix, eta_matrix, max_iterations
-    )
-
-    # Format output with all analysis
-    result = solver.format_output(solution, distance_matrix, eta_matrix)
-    result["processing_time"] = time.time() - start_time
-
-    # Add time analysis
-    time_analysis = solution.get_route_time_analysis()
-    result["time_analysis"] = time_analysis
-
-    # Add fleet cost analysis
-    vehicle_optimizer = VehicleOptimizer(config)
-    fleet_analysis = vehicle_optimizer.calculate_fleet_cost(
-        solution, distance_matrix, eta_matrix
-    )
-    result["fleet_analysis"] = fleet_analysis
-
-    return result
-
-
 def solve_from_csv_per_polygon(
     df: pd.DataFrame,
     max_knock: int = 4,
@@ -3027,4 +3548,3 @@ if __name__ == "__main__":
 
     result = solve_from_csv_per_polygon(df, 2, 3, 4, 0, 200)
     print(result)
-
