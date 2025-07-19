@@ -4,12 +4,13 @@ import time
 import requests
 
 from typing import Dict, Tuple, List
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_result
 
 
 URL_MATRIX = ""
 APIKEY_MATRIX = ""
 
-USE_HAVERSINE = False
+USE_HAVERSINE = True
 
 
 class DistanceCalculator:
@@ -33,6 +34,38 @@ class DistanceCalculator:
         
         return R * c
 
+    @staticmethod
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_not_result(lambda result: result is not None and result.status_code == 200)
+    )
+    def _make_api_request(payload: dict) -> requests.Response:
+        """Make API request with retry mechanism"""
+        params = {
+            "json": json.dumps(payload),
+            "engine": "ocelot",
+            "no_traffic": "false"
+        }
+        
+        try:
+            response = requests.get(
+                URL_MATRIX, 
+                headers={"X-Smapp-Key": APIKEY_MATRIX}, 
+                params=params,
+                timeout=30  # Add timeout to prevent hanging requests
+            )
+            
+            # Check if response is successful
+            if response.status_code == 200:
+                return response
+            else:
+                print(f"API request failed with status {response.status_code}, retrying...")
+                return None  # This will trigger a retry
+                
+        except requests.RequestException as e:
+            print(f"Request failed with exception: {e}, retrying...")
+            return None  # This will trigger a retry
 
     @staticmethod
     def build_matrices_smapp(
@@ -79,20 +112,11 @@ class DistanceCalculator:
                     ]
                 }
                 
-                params = {
-                    "json": json.dumps(payload),
-                    "engine": "ocelot",
-                    "no_traffic": "false"
-                }
-                
                 try:
-                    response = requests.get(
-                        URL_MATRIX, 
-                        headers={"X-Smapp-Key": APIKEY_MATRIX}, 
-                        params=params
-                    )
+                    # Use the retry-enabled method
+                    response = DistanceCalculator._make_api_request(payload)
                     
-                    if response.status_code == 200:
+                    if response is not None:
                         result = response.json()
                         sources_to_targets = result["sources_to_targets"][0]  # First (and only) source
                         
@@ -108,13 +132,15 @@ class DistanceCalculator:
                                 print(f"Failed to calculate distance from {source_loc} to {target_loc}")
                                 eta_matrix[source_loc][target_loc] = None
                                 distance_matrix[source_loc][target_loc] = None
-                                
                     else:
-                        print(f"API request failed with status {response.status_code}")
-                        response.raise_for_status()
+                        print(f"All retry attempts failed for batch starting at index {i}")
+                        # Set all targets in this batch to None
+                        for target_loc in batch_targets:
+                            eta_matrix[source_loc][target_loc] = None
+                            distance_matrix[source_loc][target_loc] = None
                         
-                except requests.RequestException as e:
-                    print(f"Request failed: {e}")
+                except Exception as e:
+                    print(f"Unexpected error after all retries: {e}")
                     # Set all targets in this batch to None
                     for target_loc in batch_targets:
                         eta_matrix[source_loc][target_loc] = None
