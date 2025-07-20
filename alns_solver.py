@@ -350,11 +350,11 @@ class UpdatedALNSSolver:
             return None
 
     def _check_feasibility(self, solution: Solution) -> bool:
-        """Check if solution is feasible (only unassigned parcels and knock constraints matter)"""
+        """Check if solution is feasible"""
         return (
-            len(solution.unassigned_parcels) == 0 and
-            solution.validate_knock_constraints(self.config.max_knock)
-            # Removed time window check - routes can violate time windows
+            len(solution.unassigned_parcels) == 0
+            and solution.validate_knock_constraints(self.config.max_knock)
+            and solution.validate_time_window(self.config.time_window_seconds)
         )
 
     def _should_accept_solution(
@@ -574,21 +574,6 @@ class UpdatedALNSSolver:
             if not r.is_time_feasible(self.config.time_window_seconds)
         ]
 
-        # Calculate SLA metrics (pass eta_matrix)
-        solution_sla = solution.calculate_solution_sla(self.config.time_window_seconds, eta_matrix)
-
-        # Add SLA info to each formatted route
-        for route, formatted_route in zip(solution.routes, formatted_routes):
-            route_sla = route.calculate_sla_metrics(self.config.time_window_seconds, eta_matrix)
-            formatted_route.update({
-                "sla_percentage": route_sla["sla_percentage"],
-                "on_time_parcels": route_sla["on_time_parcels"],
-                "delayed_parcels": route_sla["delayed_parcels"],
-                "route_total_duration_minutes": route_sla["route_total_duration_minutes"],
-                "is_route_time_feasible": route_sla["is_route_time_feasible"],
-                "parcel_delivery_times": route_sla["parcel_delivery_times"]  # Detailed breakdown
-            })
-
         return {
             "input_summary": {
                 "num_hubs": len(solution.pickup_terminals),
@@ -622,9 +607,6 @@ class UpdatedALNSSolver:
                 "global_optimization_applied": True,
                 "cost_efficiency_metrics": cost_metrics,
                 "map_filename": "vehicle_routes.html",
-                "sla_metrics": solution_sla,
-                "overall_sla_percentage": solution_sla["overall_sla_percentage"],
-                "unassigned_parcels_count": len(solution.unassigned_parcels),
             },
             "vehicles": formatted_routes,
             "analysis": {
@@ -716,41 +698,23 @@ class UpdatedConstructionHeuristic:
         )
 
         return solution
-    
-    def _pack_parcels_for_capacity_first(self, parcels: List[Parcel], vehicle_spec: VehicleSpec,
-                                    terminal: PickupTerminal, distance_matrix: Dict, 
-                                    eta_matrix: Dict) -> List[Parcel]:
-        """Pack parcels to maximize capacity utilization (ignore time constraints)"""
-        # Sort parcels by size (largest first to maximize packing efficiency)
-        sorted_parcels = sorted(parcels, key=lambda x: x.size, reverse=True)
 
-        # Pack parcels greedily by capacity only
-        packed = []
-        current_size = 0
-
-        for parcel in sorted_parcels:
-            if current_size + parcel.size <= vehicle_spec.capacity:
-                packed.append(parcel)
-                current_size += parcel.size
-
-        return packed
-
-    def _create_best_route(self, parcels: List[Parcel], terminal: PickupTerminal,
-                        vehicle_id: int, distance_matrix: Dict, eta_matrix: Dict) -> Optional[Route]:
-        """Create best route with capacity-first strategy (no knock violations)"""
+    def _create_best_route(
+        self,
+        parcels: List[Parcel],
+        terminal: PickupTerminal,
+        vehicle_id: int,
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+    ) -> Optional[Route]:
+        """Create best route for cost per parcel optimization"""
         best_route = None
-        best_cost_per_parcel = float('inf')
+        best_cost_per_parcel = float("inf")
 
-        # Sort vehicle types by capacity (largest first) to handle more parcels
-        sorted_vehicle_types = sorted(
-            self.config.vehicle_specs.items(), 
-            key=lambda x: x[1].capacity, 
-            reverse=True
-        )
-
-        for vehicle_type, vehicle_spec in sorted_vehicle_types:
-            # Pack parcels considering capacity (ignore time constraints for now)
-            route_parcels = self._pack_parcels_for_capacity_first(
+        # Try each vehicle type
+        for vehicle_type, vehicle_spec in self.config.vehicle_specs.items():
+            # Pack parcels considering capacity and time constraints
+            route_parcels = self._pack_parcels_for_cost_efficiency(
                 parcels, vehicle_spec, terminal, distance_matrix, eta_matrix
             )
 
@@ -769,19 +733,16 @@ class UpdatedConstructionHeuristic:
                 route_distance, route_duration = self._calculate_route_metrics(
                     route, distance_matrix, eta_matrix
                 )
-                
+
                 route.total_distance = route_distance
                 route.total_duration = route_duration
                 route.update_costs()
 
-                # Accept route even if time window is violated (we'll track this)
-                if route.cost_per_parcel < best_cost_per_parcel:
-                    best_cost_per_parcel = route.cost_per_parcel
-                    best_route = route
-                    
-                    # If we found a time-feasible route, prefer it
-                    if route.is_time_feasible(self.config.time_window_seconds):
-                        break  # Take the first time-feasible route with largest capacity
+                # Check time feasibility
+                if route.is_time_feasible(self.config.time_window_seconds):
+                    if route.cost_per_parcel < best_cost_per_parcel:
+                        best_cost_per_parcel = route.cost_per_parcel
+                        best_route = route
 
         return best_route
 
@@ -1010,36 +971,49 @@ class UpdatedALNSOperators:
 
         return new_solution
 
-    def _find_best_insertion_for_cost(self, parcel: Parcel, solution: Solution,
-                                    distance_matrix: Dict, eta_matrix: Dict) -> Optional[Tuple[int, float]]:
-        """Find best insertion position with strict knock constraint enforcement"""
+    def _find_best_insertion_for_cost(
+        self,
+        parcel: Parcel,
+        solution: Solution,
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+    ) -> Optional[Tuple[int, float]]:
+        """Find best insertion position for parcel based on cost per parcel"""
         best_route_idx = None
-        best_cost_increase = float('inf')
+        best_cost_increase = float("inf")
 
         for route_idx, route in enumerate(solution.routes):
             # Check capacity constraint
             if route.total_size + parcel.size > route.vehicle_spec.capacity:
                 continue
 
-            # STRICT knock constraint check - NEVER violate
+            # Check knock constraint
             parcel_pickup_id = self._get_parcel_pickup_id(parcel, solution)
             if parcel_pickup_id not in route.pickup_sequence:
-                current_knocks = len(solution.pickup_assignments.get(parcel_pickup_id, []))
+                current_knocks = len(
+                    solution.pickup_assignments.get(parcel_pickup_id, [])
+                )
                 if current_knocks >= self.config.max_knock:
-                    continue  # Skip this route to enforce knock constraint
+                    continue
 
-            # Calculate cost increase (ignore time feasibility for insertion)
+            # Calculate cost increase
             original_cost_per_parcel = route.cost_per_parcel
             new_parcel_count = len(route.parcels) + 1
-            new_cost_per_parcel = route.vehicle_spec.calculate_cost_per_parcel(new_parcel_count)
-            
-            cost_increase = new_cost_per_parcel - original_cost_per_parcel
-            
-            if cost_increase < best_cost_increase:
-                best_cost_increase = cost_increase
-                best_route_idx = route_idx
+            new_cost_per_parcel = route.vehicle_spec.calculate_cost_per_parcel(
+                new_parcel_count
+            )
 
-        return (best_route_idx, best_cost_increase) if best_route_idx is not None else None
+            # Simple time feasibility check
+            if self._quick_time_check(route, parcel, distance_matrix, eta_matrix):
+                cost_increase = new_cost_per_parcel - original_cost_per_parcel
+
+                if cost_increase < best_cost_increase:
+                    best_cost_increase = cost_increase
+                    best_route_idx = route_idx
+
+        return (
+            (best_route_idx, best_cost_increase) if best_route_idx is not None else None
+        )
 
     def _quick_time_check(
         self, route: Route, parcel: Parcel, distance_matrix: Dict, eta_matrix: Dict
