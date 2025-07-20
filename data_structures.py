@@ -5,6 +5,7 @@ from enum import Enum
 
 
 class VehicleType(Enum):
+    VAN = "van"
     BIKE = "bike"
     CARBOX = "carbox"
     BIG_BOX = "big-box"
@@ -144,12 +145,10 @@ class Route:
     delivery_sequence: List[
         Tuple[float, float]
     ]  # delivery locations in optimized order
-    route_sequence: List[Tuple[str, Tuple[float, float]]] = None  # Mixed sequence
+    route_sequence: List[Tuple[str, Tuple[float, float]]] = None
     total_distance: float = 0.0
     total_duration: int = 0  # in seconds
     is_optimized: bool = False
-
-    # New cost tracking fields
     total_cost: float = 0.0
     cost_per_parcel: float = 0.0
 
@@ -163,18 +162,150 @@ class Route:
         # Initialize route sequence if not provided
         if self.route_sequence is None:
             self.route_sequence = []
-            # Add pickups first
-            for pickup_id in self.pickup_sequence:
-                pickup_location = (
-                    self.parcels[0].pickup_location if self.parcels else (0, 0)
-                )
-                self.route_sequence.append(("pickup", pickup_location))
+
+            # Add pickups based on actual parcel pickup locations (not pickup_sequence)
+            pickup_locations_added = set()
+            for parcel in self.parcels:
+                pickup_loc = parcel.pickup_location
+                if pickup_loc not in pickup_locations_added:
+                    self.route_sequence.append(("pickup", pickup_loc))
+                    pickup_locations_added.add(pickup_loc)
+
             # Add deliveries
             for delivery_loc in self.delivery_sequence:
                 self.route_sequence.append(("delivery", delivery_loc))
 
         # Calculate initial costs
         self.update_costs()
+
+    def calculate_sla_metrics(self, time_window_seconds: int, eta_matrix: Dict) -> Dict:
+        """Calculate accurate SLA metrics using actual delivery times from ETA matrix"""
+        total_parcels = len(self.parcels)
+        
+        if total_parcels == 0:
+            return {
+                "total_parcels": 0,
+                "on_time_parcels": 0,
+                "delayed_parcels": 0,
+                "sla_percentage": 100.0,
+                "is_route_time_feasible": True,
+                "route_total_duration": 0,
+                "parcel_delivery_times": []
+            }
+        
+        # Calculate actual delivery time for each parcel using route sequence and ETA matrix
+        parcel_delivery_times = []
+        current_time = 0
+        current_location = None
+        on_time_count = 0
+        
+        # Find starting location (first pickup)
+        if self.route_sequence:
+            for action, location in self.route_sequence:
+                if action == "pickup":
+                    current_location = location
+                    break
+        
+        if current_location is None and self.parcels:
+            # Fallback: use first parcel's pickup location
+            current_location = self.parcels[0].pickup_location
+        
+        # Track which parcels have been delivered
+        delivered_parcels = set()
+        
+        # Go through route sequence and calculate cumulative delivery times
+        for action, location in self.route_sequence:
+            if current_location and location != current_location:
+                # Add travel time to this location
+                travel_time = eta_matrix.get(current_location, {}).get(location, 300)  # 5min default
+                current_time += travel_time
+            
+            if action == "delivery":
+                # Find which parcel(s) are delivered at this location
+                for parcel in self.parcels:
+                    if (parcel.delivery_location == location and 
+                        parcel.id not in delivered_parcels):
+                        
+                        delivery_time = current_time
+                        is_on_time = delivery_time <= time_window_seconds
+                        
+                        parcel_delivery_times.append({
+                            "parcel_id": parcel.id,
+                            "delivery_location": location,
+                            "delivery_time_seconds": delivery_time,
+                            "delivery_time_minutes": delivery_time / 60,
+                            "is_on_time": is_on_time,
+                            "delay_seconds": max(0, delivery_time - time_window_seconds)
+                        })
+                        
+                        if is_on_time:
+                            on_time_count += 1
+                        
+                        delivered_parcels.add(parcel.id)
+            
+            current_location = location
+        
+        # Handle any parcels not found in route sequence (shouldn't happen but safety check)
+        for parcel in self.parcels:
+            if parcel.id not in delivered_parcels:
+                # Assume delivered at end of route with maximum delay
+                parcel_delivery_times.append({
+                    "parcel_id": parcel.id,
+                    "delivery_location": parcel.delivery_location,
+                    "delivery_time_seconds": self.total_duration,
+                    "delivery_time_minutes": self.total_duration / 60,
+                    "is_on_time": self.total_duration <= time_window_seconds,
+                    "delay_seconds": max(0, self.total_duration - time_window_seconds)
+                })
+                
+                if self.total_duration <= time_window_seconds:
+                    on_time_count += 1
+        
+        delayed_count = total_parcels - on_time_count
+        sla_percentage = (on_time_count / total_parcels * 100) if total_parcels > 0 else 100.0
+        
+        return {
+            "total_parcels": total_parcels,
+            "on_time_parcels": on_time_count,
+            "delayed_parcels": delayed_count,
+            "sla_percentage": sla_percentage,
+            "is_route_time_feasible": self.total_duration <= time_window_seconds,
+            "route_total_duration": self.total_duration,
+            "route_total_duration_minutes": self.total_duration / 60,
+            "time_window_seconds": time_window_seconds,
+            "time_window_minutes": time_window_seconds / 60,
+            "parcel_delivery_times": parcel_delivery_times
+        }
+
+    def calculate_real_cost(self):
+        """Route real cost without penalty"""
+        return round(self.vehicle_spec.fixed_cost_per_vehicle, 2)
+
+    def calculate_real_cost_per_parcel(self):
+        return round(
+            (
+                self.vehicle_spec.fixed_cost_per_vehicle / len(self.parcels)
+                if len(self.parcels) != 0
+                else 0
+            ),
+            2,
+        )
+
+    def rebuild_route_sequence(self):
+        """Rebuild route sequence based on current parcels"""
+        self.route_sequence = []
+
+        # Add pickups based on actual parcel pickup locations
+        pickup_locations_added = set()
+        for parcel in self.parcels:
+            pickup_loc = parcel.pickup_location
+            if pickup_loc not in pickup_locations_added:
+                self.route_sequence.append(("pickup", pickup_loc))
+                pickup_locations_added.add(pickup_loc)
+
+        # Add deliveries
+        for delivery_loc in self.delivery_sequence:
+            self.route_sequence.append(("delivery", delivery_loc))
 
     def update_costs(self):
         """Update cost calculations based on current route state"""
@@ -207,8 +338,10 @@ class Route:
         additional_size = sum(p.size for p in additional_parcels)
         return self.total_size + additional_size <= self.vehicle_spec.capacity
 
-    def add_parcels(self, new_parcels: List[Parcel]):
-        """Add parcels to route and update costs"""
+    def add_parcels(
+        self, new_parcels: List[Parcel], pickup_terminals: List[PickupTerminal] = None
+    ):
+        """Add parcels to route and update pickup sequence consistently"""
         self.parcels.extend(new_parcels)
         self.total_size = sum(p.size for p in self.parcels)
 
@@ -217,14 +350,23 @@ class Route:
             if parcel.delivery_location not in self.delivery_sequence:
                 self.delivery_sequence.append(parcel.delivery_location)
 
+        # Rebuild pickup sequence based on actual parcels if terminals provided
+        if pickup_terminals:
+            self.rebuild_pickup_sequence_from_parcels(pickup_terminals)
+
+        self.rebuild_route_sequence()
         # Update costs
         self.update_costs()
 
         # Mark as needing optimization
         self.is_optimized = False
 
-    def remove_parcels(self, parcels_to_remove: List[Parcel]):
-        """Remove parcels from route and update costs"""
+    def remove_parcels(
+        self,
+        parcels_to_remove: List[Parcel],
+        pickup_terminals: List[PickupTerminal] = None,
+    ):
+        """Remove parcels from route and update pickup sequence consistently"""
         for parcel in parcels_to_remove:
             if parcel in self.parcels:
                 self.parcels.remove(parcel)
@@ -237,8 +379,31 @@ class Route:
                         self.delivery_sequence.remove(parcel.delivery_location)
 
         self.total_size = sum(p.size for p in self.parcels)
+
+        # Rebuild pickup sequence based on remaining parcels if terminals provided
+        if pickup_terminals:
+            self.rebuild_pickup_sequence_from_parcels(pickup_terminals)
+
+        self.rebuild_route_sequence()
+
         self.update_costs()
         self.is_optimized = False
+
+    def rebuild_pickup_sequence_from_parcels(
+        self, pickup_terminals: List[PickupTerminal]
+    ):
+        """Rebuild pickup sequence based on actual parcels in the route"""
+        current_pickups = set()
+
+        # Find which pickup terminals are actually represented by parcels
+        for parcel in self.parcels:
+            for terminal in pickup_terminals:
+                if parcel in terminal.parcels:
+                    current_pickups.add(terminal.pickup_id)
+                    break
+
+        # Update pickup sequence to match actual parcels
+        self.pickup_sequence = sorted(current_pickups)
 
 
 class Solution:
@@ -265,29 +430,173 @@ class Solution:
         self.total_duration = 0
         self.is_feasible = False
 
+    def _rebuild_assignments(self):
+        """Rebuild pickup assignments after route modifications"""
+        self.pickup_assignments = {}
+
+        for route in self.routes:
+            # Build pickup assignments based on actual parcels in the route
+            parcels_by_pickup = {}
+
+            # Group parcels by their pickup terminal
+            for parcel in route.parcels:
+                # Find which pickup terminal this parcel belongs to
+                pickup_id = None
+                for terminal in self.pickup_terminals:
+                    if parcel in terminal.parcels:
+                        pickup_id = terminal.pickup_id
+                        break
+
+                if pickup_id is not None:
+                    if pickup_id not in parcels_by_pickup:
+                        parcels_by_pickup[pickup_id] = []
+                    parcels_by_pickup[pickup_id].append(parcel)
+
+            # Update pickup assignments for each pickup terminal with parcels
+            for pickup_id in parcels_by_pickup.keys():
+                if pickup_id not in self.pickup_assignments:
+                    self.pickup_assignments[pickup_id] = []
+
+                # Add this vehicle to the pickup assignment if not already there
+                if route.vehicle_id not in self.pickup_assignments[pickup_id]:
+                    self.pickup_assignments[pickup_id].append(route.vehicle_id)
+
+    def calculate_solution_sla(self, time_window_seconds: int, eta_matrix: Dict) -> Dict:
+        """Calculate accurate solution SLA metrics using ETA matrix"""
+        total_parcels = 0
+        on_time_parcels = 0
+        delayed_parcels = 0
+        routes_violating_time = 0
+        
+        route_slas = []
+        all_parcel_delivery_times = []
+        
+        for route in self.routes:
+            route_sla = route.calculate_sla_metrics(time_window_seconds, eta_matrix)
+            route_slas.append({
+                "vehicle_id": route.vehicle_id,
+                "vehicle_type": route.vehicle_type.value,
+                **route_sla
+            })
+            
+            total_parcels += route_sla["total_parcels"]
+            on_time_parcels += route_sla["on_time_parcels"] 
+            delayed_parcels += route_sla["delayed_parcels"]
+            
+            if not route_sla["is_route_time_feasible"]:
+                routes_violating_time += 1
+            
+            # Collect all parcel delivery times
+            all_parcel_delivery_times.extend(route_sla["parcel_delivery_times"])
+        
+        # Add unassigned parcels (considered as not delivered = delayed)
+        unassigned_count = len(self.unassigned_parcels)
+        total_parcels += unassigned_count
+        delayed_parcels += unassigned_count
+        
+        # Add unassigned parcels to delivery times list
+        for parcel in self.unassigned_parcels:
+            all_parcel_delivery_times.append({
+                "parcel_id": parcel.id,
+                "delivery_location": parcel.delivery_location,
+                "delivery_time_seconds": None,
+                "delivery_time_minutes": None,
+                "is_on_time": False,
+                "delay_seconds": None,
+                "status": "unassigned"
+            })
+        
+        overall_sla = (on_time_parcels / total_parcels * 100) if total_parcels > 0 else 100.0
+        
+        # Calculate delay statistics
+        delayed_parcel_times = [p for p in all_parcel_delivery_times 
+                            if not p["is_on_time"] and p.get("delay_seconds") is not None]
+        
+        avg_delay_seconds = 0
+        max_delay_seconds = 0
+        if delayed_parcel_times:
+            delays = [p["delay_seconds"] for p in delayed_parcel_times]
+            avg_delay_seconds = sum(delays) / len(delays)
+            max_delay_seconds = max(delays)
+        
+        return {
+            "total_parcels": total_parcels,
+            "on_time_parcels": on_time_parcels,
+            "delayed_parcels": delayed_parcels,
+            "unassigned_parcels": unassigned_count,
+            "overall_sla_percentage": overall_sla,
+            "routes_violating_time": routes_violating_time,
+            "total_routes": len(self.routes),
+            "average_delay_seconds": avg_delay_seconds,
+            "average_delay_minutes": avg_delay_seconds / 60,
+            "max_delay_seconds": max_delay_seconds,
+            "max_delay_minutes": max_delay_seconds / 60,
+            "time_window_hours": time_window_seconds / 3600,
+            "route_slas": route_slas,
+            "parcel_delivery_details": all_parcel_delivery_times
+        }
+
     def add_route(self, route: Route):
-        """Add a route to the solution"""
+        """Add a route to the solution with proper pickup assignment tracking"""
         self.routes.append(route)
 
-        # Update pickup assignments
-        for pickup_id in route.pickup_sequence:
+        # Build pickup assignments based on actual parcels in the route
+        parcels_by_pickup = {}
+
+        # Group parcels by their pickup terminal
+        for parcel in route.parcels:
+            # Find which pickup terminal this parcel belongs to
+            pickup_id = None
+            for terminal in self.pickup_terminals:
+                if parcel in terminal.parcels:
+                    pickup_id = terminal.pickup_id
+                    break
+
+            if pickup_id is not None:
+                if pickup_id not in parcels_by_pickup:
+                    parcels_by_pickup[pickup_id] = []
+                parcels_by_pickup[pickup_id].append(parcel)
+
+        # Update pickup assignments for each pickup terminal with parcels
+        for pickup_id in parcels_by_pickup.keys():
             if pickup_id not in self.pickup_assignments:
                 self.pickup_assignments[pickup_id] = []
-            self.pickup_assignments[pickup_id].append(route.vehicle_id)
+
+            # Add this vehicle to the pickup assignment if not already there
+            if route.vehicle_id not in self.pickup_assignments[pickup_id]:
+                self.pickup_assignments[pickup_id].append(route.vehicle_id)
 
         # Update solution costs
         self.update_solution_costs()
 
     def remove_route(self, route: Route):
-        """Remove a route from the solution"""
+        """Remove a route from the solution with proper pickup assignment cleanup"""
         if route in self.routes:
             self.routes.remove(route)
 
-            # Update pickup assignments
-            for pickup_id in route.pickup_sequence:
+            # Clean up pickup assignments
+            parcels_by_pickup = {}
+
+            # Group parcels by their pickup terminal for the removed route
+            for parcel in route.parcels:
+                pickup_id = None
+                for terminal in self.pickup_terminals:
+                    if parcel in terminal.parcels:
+                        pickup_id = terminal.pickup_id
+                        break
+
+                if pickup_id is not None:
+                    if pickup_id not in parcels_by_pickup:
+                        parcels_by_pickup[pickup_id] = []
+                    parcels_by_pickup[pickup_id].append(parcel)
+
+            # Remove vehicle from pickup assignments for terminals it was serving
+            for pickup_id in parcels_by_pickup.keys():
                 if pickup_id in self.pickup_assignments:
                     if route.vehicle_id in self.pickup_assignments[pickup_id]:
                         self.pickup_assignments[pickup_id].remove(route.vehicle_id)
+
+                    # Clean up empty pickup assignments
                     if not self.pickup_assignments[pickup_id]:
                         del self.pickup_assignments[pickup_id]
 
@@ -398,7 +707,7 @@ class Solution:
                 }
 
             vehicle_efficiency[vtype]["count"] += 1
-            vehicle_efficiency[vtype]["total_cost"] += route.total_cost
+            vehicle_efficiency[vtype]["total_cost"] += route.calculate_real_cost()
             vehicle_efficiency[vtype]["total_parcels"] += len(route.parcels)
             vehicle_efficiency[vtype]["average_utilization"] += utilization
 
@@ -471,15 +780,6 @@ class Solution:
 
         return utilization
 
-    def _rebuild_assignments(self):
-        """Rebuild pickup assignments after route modifications"""
-        self.pickup_assignments = {}
-        for route in self.routes:
-            for pickup_id in route.pickup_sequence:
-                if pickup_id not in self.pickup_assignments:
-                    self.pickup_assignments[pickup_id] = []
-                self.pickup_assignments[pickup_id].append(route.vehicle_id)
-
     def _get_pickup_location(self, pickup_id: int) -> Tuple[float, float]:
         """Get pickup location by ID"""
         for terminal in self.pickup_terminals:
@@ -517,6 +817,79 @@ class Solution:
             analysis["routes"].append(route_info)
 
         return analysis
+
+    def validate_pickup_assignments_detailed(self, max_knock: int) -> Dict:
+        """Enhanced validation with detailed pickup assignment analysis"""
+        validation_result = {
+            "is_valid": True,
+            "errors": [],
+            "warnings": [],
+            "pickup_analysis": {},
+        }
+
+        # Build expected assignments from actual route data
+        expected_assignments = {}
+
+        for route in self.routes:
+            # Group parcels by pickup terminal
+            parcels_by_pickup = {}
+
+            for parcel in route.parcels:
+                pickup_id = None
+                for terminal in self.pickup_terminals:
+                    if parcel in terminal.parcels:
+                        pickup_id = terminal.pickup_id
+                        break
+
+                if pickup_id is not None:
+                    if pickup_id not in parcels_by_pickup:
+                        parcels_by_pickup[pickup_id] = []
+                    parcels_by_pickup[pickup_id].append(parcel)
+
+            # Update expected assignments
+            for pickup_id in parcels_by_pickup.keys():
+                if pickup_id not in expected_assignments:
+                    expected_assignments[pickup_id] = []
+                if route.vehicle_id not in expected_assignments[pickup_id]:
+                    expected_assignments[pickup_id].append(route.vehicle_id)
+
+        # Compare expected vs actual assignments
+        for pickup_id, expected_vehicles in expected_assignments.items():
+            actual_vehicles = self.pickup_assignments.get(pickup_id, [])
+
+            validation_result["pickup_analysis"][pickup_id] = {
+                "expected_vehicles": sorted(expected_vehicles),
+                "actual_vehicles": sorted(actual_vehicles),
+                "is_consistent": set(expected_vehicles) == set(actual_vehicles),
+                "missing_vehicles": list(set(expected_vehicles) - set(actual_vehicles)),
+                "extra_vehicles": list(set(actual_vehicles) - set(expected_vehicles)),
+                "knock_count": len(set(expected_vehicles)),
+                "knock_violation": len(set(expected_vehicles)) > max_knock,
+            }
+
+            if set(expected_vehicles) != set(actual_vehicles):
+                validation_result["is_valid"] = False
+                validation_result["errors"].append(
+                    f"Pickup {pickup_id}: Expected vehicles {sorted(expected_vehicles)}, "
+                    f"got {sorted(actual_vehicles)}"
+                )
+
+            if len(set(expected_vehicles)) > max_knock:
+                validation_result["is_valid"] = False
+                validation_result["errors"].append(
+                    f"Pickup {pickup_id}: Knock constraint violated "
+                    f"({len(set(expected_vehicles))} > {max_knock})"
+                )
+
+        # Check for orphaned assignments
+        for pickup_id, vehicles in self.pickup_assignments.items():
+            if pickup_id not in expected_assignments:
+                validation_result["is_valid"] = False
+                validation_result["errors"].append(
+                    f"Pickup {pickup_id}: Has assignment {vehicles} but no routes serve this pickup"
+                )
+
+        return validation_result
 
 
 class ProblemConfig:
