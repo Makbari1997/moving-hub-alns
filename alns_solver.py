@@ -500,6 +500,7 @@ class UpdatedALNSSolver:
         formatted_routes = []
         total_duration_seconds = 0
 
+
         for route in solution.routes:
             route_distance = getattr(route, "total_distance", 0)
             route_duration = getattr(route, "total_duration", 0)
@@ -509,16 +510,41 @@ class UpdatedALNSSolver:
             physical_route = []
             route_indices = []
 
+            route.rebuild_route_sequence() 
+
             pickup_locations_in_route = set()
             for action, location in route.route_sequence:
                 if action == "pickup":
                     pickup_locations_in_route.add(location)
 
+            missing_pickups = set()
             for parcel in route.parcels:
                 pickup_loc = parcel.pickup_location
                 if pickup_loc not in pickup_locations_in_route:
-                    # Insert pickup at the beginning if missing
-                    route.route_sequence.insert(0, ("pickup", pickup_loc))
+                    missing_pickups.add(pickup_loc)
+
+            if missing_pickups:
+                # Create new sequence with missing pickups at start
+                new_sequence = []
+                
+                # Add missing pickups first
+                for pickup_loc in missing_pickups:
+                    new_sequence.append(("pickup", pickup_loc))
+                
+                # Add existing sequence (skip existing pickups to avoid duplicates)
+                for action, location in route.route_sequence:
+                    if action == "pickup" and location not in missing_pickups:
+                        new_sequence.append((action, location))
+                    elif action == "delivery":
+                        new_sequence.append((action, location))
+                
+                route.route_sequence = new_sequence
+
+            # for parcel in route.parcels:
+            #     pickup_loc = parcel.pickup_location
+            #     if pickup_loc not in pickup_locations_in_route:
+            #         # Insert pickup at the beginning if missing
+            #         route.route_sequence.insert(0, ("pickup", pickup_loc))
 
             for i, (action, location) in enumerate(route.route_sequence):
                 physical_route.append((location[0], location[1]))
