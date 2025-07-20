@@ -82,7 +82,7 @@ class DistanceCalculator:
 
         # Process each location as a source
         for source_loc in locations:
-            print(f"Processing source: {source_loc}")
+            # print(f"Processing source: {source_loc}")
 
             # Get all other locations as targets (excluding self)
             target_locations = [loc for loc in locations if loc != source_loc]
@@ -149,7 +149,7 @@ class DistanceCalculator:
                         distance_matrix[source_loc][target_loc] = None
 
                 # Add delay between batches to avoid rate limiting
-                # time.sleep(2)
+                time.sleep(0.5)
 
         return distance_matrix, eta_matrix
 
