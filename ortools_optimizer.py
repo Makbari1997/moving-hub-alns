@@ -600,6 +600,122 @@ class GlobalRouteOptimizer:
         return merged_solution
 
 
+# class GlobalOptimizationController:
+#     """
+#     Controller for managing when and how to apply global optimization
+#     """
+
+#     def __init__(self, config: ProblemConfig):
+#         self.config = config
+#         self.optimizer = GlobalRouteOptimizer(config)
+#         self.vehicle_optimizer = UpdatedVehicleOptimizer(config)
+#         self.last_optimization_iteration = -1
+#         self.optimization_interval = 30  # Optimize every 30 iterations
+#         self.min_improvement_threshold = 0.01  # 1% improvement threshold
+#         self.enable_vehicle_optimization = True
+#         self.vehicle_optimization_frequency = 2
+
+#     def should_optimize(
+#         self,
+#         iteration: int,
+#         solution: Solution,
+#         iterations_since_improvement: int,
+#         optimization_interval: int,
+#     ) -> bool:
+#         """
+#         Determine if global optimization should be applied
+
+#         Args:
+#             iteration: Current ALNS iteration
+#             solution: Current solution
+#             iterations_since_improvement: Iterations since last improvement
+
+#         Returns:
+#             True if optimization should be applied
+#         """
+#         # Always optimize at start
+#         if iteration == -1:
+#             print(f"Sould optimize as iteration is {iteration}")
+#             return True
+
+#         # Optimize at regular intervals
+#         if iteration - self.last_optimization_iteration >= optimization_interval:
+#             print(
+#                 f"Should optimize as {iteration} - {self.last_optimization_iteration} >= {optimization_interval}"
+#             )
+#             self.last_optimization_iteration = iteration
+#             return True
+
+#         # Optimize when stagnating
+#         # if iterations_since_improvement >= 20:
+#         #     return True
+
+#         # Optimize when we have multiple routes with low utilization
+#         if len(solution.routes) > 1:
+#             avg_utilization = sum(
+#                 r.get_utilization_percentage() for r in solution.routes
+#             ) / len(solution.routes)
+#             if avg_utilization < 60:  # Low utilization suggests merge opportunities
+#                 print(
+#                     f"Should optimize as we have multiple routes with low utilization"
+#                 )
+#                 return True
+
+#         return False
+
+#     def optimize_if_needed(
+#         self,
+#         iteration: int,
+#         solution: Solution,
+#         iterations_since_improvement: int,
+#         distance_matrix: Dict,
+#         eta_matrix: Dict,
+#         optimization_intervals: int,
+#     ) -> Solution:
+#         """
+#         Apply global optimization if conditions are met
+
+#         Args:
+#             iteration: Current ALNS iteration
+#             solution: Current solution
+#             iterations_since_improvement: Iterations since last improvement
+#             distance_matrix: Distance matrix
+#             eta_matrix: ETA matrix
+
+#         Returns:
+#             Optimized solution (or original if optimization not needed)
+#         """
+#         if not self.should_optimize(
+#             iteration, solution, iterations_since_improvement, optimization_intervals
+#         ):
+#             return solution
+#         print("Solution should be optimized...")
+#         original_cost = solution.average_cost_per_parcel
+
+#         # Apply global optimization
+#         print("Global optimization in progress...")
+#         optimized_solution = self.optimizer.optimize_solution_globally(
+#             solution, distance_matrix, eta_matrix, enable_route_merging=True
+#         )
+#         print("Global Optimization Done...")
+#         # Check if optimization was beneficial
+#         improvement = (
+#             original_cost - optimized_solution.average_cost_per_parcel
+#         ) / original_cost
+
+#         if improvement >= self.min_improvement_threshold:
+#             self.last_optimization_iteration = iteration
+#             return optimized_solution
+#         else:
+#             return solution
+
+#     def final_optimization(
+#         self, solution: Solution, distance_matrix: Dict, eta_matrix: Dict
+#     ) -> Solution:
+#         """Apply final global optimization before returning solution"""
+#         return self.optimizer.optimize_solution_globally(
+#             solution, distance_matrix, eta_matrix, enable_route_merging=True
+#         )
 class GlobalOptimizationController:
     """
     Controller for managing when and how to apply global optimization
