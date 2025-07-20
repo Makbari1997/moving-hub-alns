@@ -129,13 +129,6 @@ class DataProcessor:
 
     def _determine_parcel_size(self, row: pd.Series) -> int:
         """Determine parcel size from row data"""
-        # Default implementation - can be enhanced based on your business logic
-        # You can add columns like 'weight', 'volume', 'package_type' to determine size
-
-        # Example business logic (customize as needed):
-        # - Check if there's a size/weight/volume column
-        # - Use time slots to determine urgency/size
-        # - Use contact info or other metadata
 
         if "package_size" in row and pd.notna(row["package_size"]):
             return int(row["package_size"])
@@ -225,3 +218,32 @@ class DataProcessor:
                 for terminal in pickup_terminals
             ],
         }
+
+    def _create_pickup_terminals_from_df(self, df: pd.DataFrame) -> List[PickupTerminal]:
+        """Create pickup terminals directly from DataFrame (for testing)"""
+        
+        # Create parcels
+        parcels = []
+        for idx, row in df.iterrows():
+            try:
+                parcel = Parcel(
+                    id=int(row["order_request_id"]),
+                    pickup_location=(
+                        float(row["pickup_latitude"]),
+                        float(row["pickup_longitude"]),
+                    ),
+                    delivery_location=(
+                        float(row["latitude"]), 
+                        float(row["longitude"])
+                    ),
+                    size=self._determine_parcel_size(row),
+                )
+                parcels.append(parcel)
+            except Exception as e:
+                print(f"Warning: Could not create parcel from row {idx}: {e}")
+                continue
+        
+        # Group into pickup terminals
+        pickup_terminals = self._group_parcels_into_terminals(parcels)
+        
+        return pickup_terminals
