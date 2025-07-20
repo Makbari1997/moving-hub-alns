@@ -274,8 +274,8 @@ class PerformanceOptimizedSolver:
                 vehicle_type=vehicle_type,
                 capacity=capacity,
                 cost_per_hour=cost_per_hour,
-                min_utilization_threshold=0.3,
-                optimal_utilization_range=(0.6, 0.9),
+                min_utilization_threshold=constants.MIN_UTILIZATION_THRESHOLD,
+                optimal_utilization_range=constants.OPTIMAL_UTILIZATION_RANGE,
             )
 
         processor = DataProcessor(default_parcel_size, proximity_threshold_meters)
