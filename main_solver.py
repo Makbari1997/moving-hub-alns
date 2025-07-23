@@ -38,6 +38,7 @@ class PerformanceOptimizedSolver:
         proximity_threshold_meters: float = 100.0,
         max_iterations: int = 200,
         performance_target_seconds: int = 60,
+        matrix_id: str = None
     ) -> Dict:
         """
         Main solve method optimized for performance
@@ -91,6 +92,7 @@ class PerformanceOptimizedSolver:
                     proximity_threshold_meters,
                     max_iterations,
                     performance_target_seconds,
+                    matrix_id
                 )
 
                 if "distance_matrix" in result:
@@ -176,6 +178,7 @@ class PerformanceOptimizedSolver:
         proximity_threshold_meters: float,
         max_iterations: int,
         performance_target_seconds: int,
+        matrix_id: str
     ) -> Dict:
         """Solve VRP for a single polygon with performance optimizations"""
 
@@ -204,7 +207,7 @@ class PerformanceOptimizedSolver:
         if self.verbose_logging:
             print("Step 2: Building distance matrix...")
 
-        distance_matrix, eta_matrix = self._build_distance_matrices(pickup_terminals)
+        distance_matrix, eta_matrix = self._build_distance_matrices(pickup_terminals, f"{matrix_id}_{polygon_id}")
 
         if self.verbose_logging:
             print("Step 3: Solving VRP...")
@@ -317,7 +320,7 @@ class PerformanceOptimizedSolver:
         return pickup_terminals
 
     def _build_distance_matrices(
-        self, pickup_terminals: List[PickupTerminal]
+        self, pickup_terminals: List[PickupTerminal], matrix_id: str
     ) -> Tuple[Dict, Dict]:
         """Build distance and ETA matrices"""
 
@@ -335,7 +338,7 @@ class PerformanceOptimizedSolver:
             print(f"  - Building matrices for {len(all_locations)} locations")
 
         # Build matrices
-        distance_matrix, eta_matrix = DistanceCalculator.build_matrices(all_locations)
+        distance_matrix, eta_matrix = DistanceCalculator.build_matrices(all_locations, matrix_id)
 
         return distance_matrix, eta_matrix
 
