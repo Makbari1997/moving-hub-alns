@@ -1184,14 +1184,14 @@ class UpdatedConstructionHeuristic:
 
     def __init__(self, config: ProblemConfig):
         self.config = config
-
+    
     def greedy_construction(
         self,
         pickup_terminals: List[PickupTerminal],
         distance_matrix: Dict,
         eta_matrix: Dict,
     ) -> Solution:
-        """Enhanced greedy construction heuristic with STRICT knock constraint enforcement"""
+        """Enhanced greedy construction heuristic with vehicle count control for high max_knock"""
         solution = Solution(pickup_terminals, self.config.vehicle_specs)
         solution._max_knock = self.config.max_knock  # Store for validation
         vehicle_counter = 1
@@ -1200,6 +1200,34 @@ class UpdatedConstructionHeuristic:
         sorted_terminals = sorted(
             pickup_terminals, key=lambda x: len(x.parcels), reverse=True
         )
+
+        # 🔧 NEW: Calculate target vehicle count based on max_knock to prevent over-consolidation
+        total_parcels = sum(len(terminal.parcels) for terminal in pickup_terminals)
+        
+        if self.config.max_knock >= 4:
+            # For high max_knock, we need to ensure we don't over-consolidate
+            # Target: 1 vehicle per 8-12 parcels (more conservative)
+            target_parcels_per_vehicle = 8 + (self.config.time_window_hours - 3) * 2  # 8-10 parcels per vehicle
+            min_vehicles_needed = max(
+                total_parcels // target_parcels_per_vehicle,
+                len(pickup_terminals),  # At least 1 vehicle per terminal
+                3  # Minimum 3 vehicles for any decent-sized problem
+            )
+        elif self.config.max_knock >= 2:
+            # Medium max_knock: moderate consolidation
+            target_parcels_per_vehicle = 12 + (self.config.time_window_hours - 3) * 3  # 12-15 parcels per vehicle
+            min_vehicles_needed = max(
+                total_parcels // target_parcels_per_vehicle,
+                len(pickup_terminals) // 2,  # Allow some terminal sharing
+                2  # Minimum 2 vehicles
+            )
+        else:
+            # Low max_knock: allow aggressive consolidation
+            min_vehicles_needed = 0  # Disable targeting for low max_knock
+            force_conservative_packing = False
+
+        print(f"Target guidance: {total_parcels} parcels, max_knock={self.config.max_knock}, "
+            f"aiming for ~{min_vehicles_needed} vehicles (current logic will determine actual count)")
 
         # Process each terminal with knock constraint awareness
         for terminal in sorted_terminals:
@@ -1215,28 +1243,36 @@ class UpdatedConstructionHeuristic:
                     print(f"Warning: Terminal {terminal.pickup_id} already has {current_vehicles_for_pickup} vehicles (max_knock={self.config.max_knock})")
                     break
 
-                # Try to create route (time-feasible first, then with violations)
-                best_route = None
+                # 🔧 MODIFIED: Adjust parcel packing aggressiveness based on current vehicle count vs target
+                current_vehicle_count = len(solution.routes)
                 
-                # Phase 1: Try time-feasible route
-                best_route = self._create_best_route(
+                # If we have too few vehicles relative to our target, be more conservative with packing
+                if min_vehicles_needed > 0 and current_vehicle_count < min_vehicles_needed * 0.8:  # Only if targeting is enabled
+                    force_conservative_packing = True
+                    print(f"Using conservative packing: have {current_vehicle_count} vehicles, target ~{min_vehicles_needed}")
+                else:
+                    force_conservative_packing = False
+                # Try time-feasible route first, but with adjusted limits
+                best_route = self._create_best_route_with_vehicle_target(
                     remaining_parcels,
                     terminal,
                     vehicle_counter,
                     distance_matrix,
                     eta_matrix,
-                    allow_time_violations=False
+                    allow_time_violations=False,
+                    force_conservative=force_conservative_packing
                 )
 
-                # Phase 2: If no time-feasible route and violations allowed, try with violations
+                # Phase 2: If no time-feasible route and violations allowed, try with violations but still controlled
                 if not best_route and self.config.allow_time_violations:
-                    best_route = self._create_best_route(
+                    best_route = self._create_best_route_with_vehicle_target(
                         remaining_parcels,
                         terminal,
                         vehicle_counter,
                         distance_matrix,
                         eta_matrix,
-                        allow_time_violations=True
+                        allow_time_violations=True,
+                        force_conservative=force_conservative_packing
                     )
 
                 if best_route:
@@ -1259,6 +1295,18 @@ class UpdatedConstructionHeuristic:
                     solution.unassigned_parcels.extend(remaining_parcels)
                     break
 
+        # 🔧 NEW: Post-construction vehicle count check and adjustment
+        final_vehicle_count = len(solution.routes)
+        print(f"Post-construction: {final_vehicle_count} vehicles created, target was ~{min_vehicles_needed}")
+        
+        # If we ended up with too few vehicles for high max_knock scenarios, try to split some routes
+        if (self.config.max_knock >= 4 and 
+            final_vehicle_count < min_vehicles_needed * 0.7 and  # We're significantly under target
+            final_vehicle_count > 0):
+            
+            print(f"Attempting to split large routes to reach better vehicle count...")
+            solution = self._split_large_routes_if_needed(solution, distance_matrix, eta_matrix, min_vehicles_needed)
+
         # Calculate solution metrics with penalty support
         solution.calculate_cost_and_time(
             distance_matrix, eta_matrix, self.config.time_violation_penalty_per_minute
@@ -1266,6 +1314,322 @@ class UpdatedConstructionHeuristic:
         solution.update_feasibility_status(self.config.max_knock, self.config.time_window_seconds)
 
         return solution
+    
+    def _create_best_route_with_vehicle_target(
+        self,
+        parcels: List[Parcel],
+        terminal: PickupTerminal,
+        vehicle_id: int,
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+        allow_time_violations: bool = False,
+        force_conservative: bool = False,
+    ) -> Optional[Route]:
+        """
+        Create best route with vehicle count targeting in mind
+        """
+        best_route = None
+        best_cost_per_parcel = float("inf")
+
+        # Try each vehicle type
+        for vehicle_type, vehicle_spec in self.config.vehicle_specs.items():
+            # 🔧 MODIFIED: Adjust capacity limits based on whether we need more vehicles
+            time_window_hours = self.config.time_window_hours
+            
+            if force_conservative:
+                # Be more conservative when we need more vehicles
+                if self.config.max_knock >= 4:
+                    max_parcels_for_time_window = max(2, int(time_window_hours * 1.0))  # Very conservative
+                else:
+                    max_parcels_for_time_window = max(3, int(time_window_hours * 1.2))  # Somewhat conservative
+            else:
+                # Use original logic when vehicle count is adequate
+                max_parcels_for_time_window = max(3, int(time_window_hours * 2))
+            
+            available_parcels = parcels[:max_parcels_for_time_window]
+            
+            # Pack parcels considering both capacity and time constraints
+            route_parcels = self._pack_parcels_intelligently(
+                available_parcels,
+                vehicle_spec,
+                terminal,
+                distance_matrix,
+                eta_matrix,
+                allow_time_violations,
+            )
+
+            if route_parcels:
+                # Create route
+                route = Route(
+                    vehicle_id=vehicle_id,
+                    vehicle_type=vehicle_type,
+                    vehicle_spec=vehicle_spec,
+                    parcels=route_parcels,
+                    pickup_sequence=[terminal.pickup_id],
+                    delivery_sequence=[p.delivery_location for p in route_parcels],
+                )
+
+                # Calculate route metrics
+                route_distance, route_duration = self._calculate_route_metrics(
+                    route, distance_matrix, eta_matrix
+                )
+
+                route.total_distance = route_distance
+                route.total_duration = route_duration
+                route.update_time_feasibility(self.config.time_window_seconds)
+                route.update_costs(self.config.time_violation_penalty_per_minute)
+
+                # Check constraints based on mode
+                is_acceptable = True
+                if not allow_time_violations:
+                    is_acceptable = route.is_time_feasible
+                else:
+                    violation_ratio = route.time_violation_seconds / self.config.time_window_seconds if self.config.time_window_seconds > 0 else 0
+                    is_acceptable = violation_ratio <= 0.5  # Max 50% over time window
+
+                if is_acceptable and route.cost_per_parcel < best_cost_per_parcel:
+                    best_cost_per_parcel = route.cost_per_parcel
+                    best_route = route
+
+        return best_route
+
+    def _split_large_routes_if_needed(
+        self, 
+        solution: Solution, 
+        distance_matrix: Dict, 
+        eta_matrix: Dict, 
+        target_vehicle_count: int
+    ) -> Solution:
+        """
+        Split large routes if we have too few vehicles for the problem size
+        """
+        current_count = len(solution.routes)
+        vehicles_needed = max(0, target_vehicle_count - current_count)
+        
+        if vehicles_needed <= 0:
+            return solution
+        
+        print(f"Attempting to split routes to add ~{vehicles_needed} more vehicles...")
+        
+        # Find routes with the most parcels that might be splittable
+        splittable_routes = [
+            (i, route) for i, route in enumerate(solution.routes) 
+            if len(route.parcels) >= 6  # Only consider routes with 6+ parcels
+        ]
+        
+        # Sort by parcel count (largest first)
+        splittable_routes.sort(key=lambda x: len(x[1].parcels), reverse=True)
+        
+        splits_made = 0
+        max_splits = min(vehicles_needed, len(splittable_routes), 3)  # Limit splits
+        
+        for route_idx, route in splittable_routes[:max_splits]:
+            if splits_made >= vehicles_needed:
+                break
+                
+            # Try to split this route
+            split_routes = self._attempt_route_split(route, distance_matrix, eta_matrix)
+            
+            if split_routes and len(split_routes) > 1:
+                # Remove original route and add split routes
+                solution.routes.pop(route_idx - splits_made)  # Adjust index for previous removals
+                
+                for split_route in split_routes:
+                    solution.routes.append(split_route)
+                
+                splits_made += len(split_routes) - 1  # Net increase in vehicles
+                print(f"Split route {route.vehicle_id} into {len(split_routes)} routes")
+        
+        # Rebuild pickup assignments
+        solution._rebuild_assignments()
+        
+        print(f"Split complete: {current_count} -> {len(solution.routes)} vehicles (+{len(solution.routes) - current_count})")
+        return solution
+
+    def _attempt_route_split(self, route: Route, distance_matrix: Dict, eta_matrix: Dict) -> Optional[List[Route]]:
+        """
+        Attempt to split a route into two smaller routes
+        """
+        if len(route.parcels) < 4:  # Need at least 4 parcels to split meaningfully
+            return None
+        
+        # Simple split: divide parcels roughly in half
+        parcels = route.parcels
+        split_point = len(parcels) // 2
+        
+        part1_parcels = parcels[:split_point]
+        part2_parcels = parcels[split_point:]
+        
+        split_routes = []
+        
+        for i, parcel_subset in enumerate([part1_parcels, part2_parcels]):
+            if not parcel_subset:
+                continue
+            
+            # Create route for this subset
+            new_route = Route(
+                vehicle_id=route.vehicle_id + i * 1000,  # Avoid ID conflicts
+                vehicle_type=route.vehicle_type,
+                vehicle_spec=route.vehicle_spec,
+                parcels=parcel_subset,
+                pickup_sequence=route.pickup_sequence.copy(),
+                delivery_sequence=[p.delivery_location for p in parcel_subset],
+            )
+            
+            # Calculate metrics for the split route
+            route_distance, route_duration = self._calculate_route_metrics(
+                new_route, distance_matrix, eta_matrix
+            )
+            
+            new_route.total_distance = route_distance
+            new_route.total_duration = route_duration
+            new_route.update_time_feasibility(self.config.time_window_seconds)
+            new_route.update_costs(self.config.time_violation_penalty_per_minute)
+            
+            split_routes.append(new_route)
+        
+        # Only return split if both parts are reasonable
+        if len(split_routes) == 2:
+            # Check if split is beneficial (reduces total violations)
+            original_violations = route.time_violation_seconds
+            split_violations = sum(r.time_violation_seconds for r in split_routes)
+            
+            if split_violations <= original_violations:
+                return split_routes
+        
+        return None
+    
+    def _create_best_route_with_capacity_limit(
+        self,
+        parcels: List[Parcel],
+        terminal: PickupTerminal,
+        vehicle_id: int,
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+        allow_time_violations: bool = False,
+    ) -> Optional[Route]:
+        """
+        Create best route with intelligent capacity limits to prevent over-consolidation
+        """
+        best_route = None
+        best_cost_per_parcel = float("inf")
+
+        # Try each vehicle type
+        for vehicle_type, vehicle_spec in self.config.vehicle_specs.items():
+            # 🔧 NEW FIX: Limit route capacity based on time window
+            # Longer time windows allow more parcels, but with reasonable limits
+            time_window_hours = self.config.time_window_hours
+            
+            # Calculate smart capacity limit based on time window and parcels
+            # Don't pack more than what can reasonably be delivered in time window
+            max_parcels_for_time_window = max(3, int(time_window_hours * 2))  # ~2 parcels per hour max
+            available_parcels = parcels[:max_parcels_for_time_window]  # Limit parcels to consider
+            
+            # Pack parcels considering both capacity and time constraints
+            route_parcels = self._pack_parcels_intelligently(
+                available_parcels,  # Use limited parcels
+                vehicle_spec,
+                terminal,
+                distance_matrix,
+                eta_matrix,
+                allow_time_violations,
+            )
+
+            if route_parcels:
+                # Create route
+                route = Route(
+                    vehicle_id=vehicle_id,
+                    vehicle_type=vehicle_type,
+                    vehicle_spec=vehicle_spec,
+                    parcels=route_parcels,
+                    pickup_sequence=[terminal.pickup_id],
+                    delivery_sequence=[p.delivery_location for p in route_parcels],
+                )
+
+                # Calculate route metrics
+                route_distance, route_duration = self._calculate_route_metrics(
+                    route, distance_matrix, eta_matrix
+                )
+
+                route.total_distance = route_distance
+                route.total_duration = route_duration
+                route.update_time_feasibility(self.config.time_window_seconds)
+                route.update_costs(self.config.time_violation_penalty_per_minute)
+
+                # Check constraints based on mode
+                is_acceptable = True
+                if not allow_time_violations:
+                    # Strict mode: require time feasibility
+                    is_acceptable = route.is_time_feasible
+                else:
+                    # Soft mode: allow reasonable violations only
+                    violation_ratio = route.time_violation_seconds / self.config.time_window_seconds if self.config.time_window_seconds > 0 else 0
+                    is_acceptable = violation_ratio <= 0.5  # Max 50% over time window
+
+                if is_acceptable and route.cost_per_parcel < best_cost_per_parcel:
+                    best_cost_per_parcel = route.cost_per_parcel
+                    best_route = route
+
+        return best_route
+
+    def _pack_parcels_intelligently(
+        self,
+        parcels: List[Parcel],
+        vehicle_spec: VehicleSpec,
+        terminal: PickupTerminal,
+        distance_matrix: Dict,
+        eta_matrix: Dict,
+        allow_time_violations: bool = False,
+    ) -> List[Parcel]:
+        """Pack parcels intelligently to prevent over-consolidation"""
+        terminal_location = (terminal.lat, terminal.lon)
+
+        def delivery_distance(parcel):
+            return distance_matrix.get(terminal_location, {}).get(
+                parcel.delivery_location, float("inf")
+            )
+
+        sorted_parcels = sorted(parcels, key=delivery_distance)
+
+        # Pack parcels with capacity and time limits
+        packed = []
+        current_size = 0
+        estimated_time = 0
+
+        for parcel in sorted_parcels:
+            if current_size + parcel.size <= vehicle_spec.capacity:
+                # Estimate time for this parcel
+                delivery_location = parcel.delivery_location
+                if packed:
+                    # Add to existing route
+                    last_location = packed[-1].delivery_location
+                    additional_time = eta_matrix.get(last_location, {}).get(delivery_location, 300)
+                else:
+                    # First parcel
+                    additional_time = eta_matrix.get(terminal_location, {}).get(delivery_location, 300)
+                
+                new_estimated_time = estimated_time + additional_time
+                
+                # Check time constraints
+                if allow_time_violations:
+                    # Allow up to 50% over time window
+                    max_time = self.config.time_window_seconds * 1.5
+                    if new_estimated_time <= max_time:
+                        packed.append(parcel)
+                        current_size += parcel.size
+                        estimated_time = new_estimated_time
+                    else:
+                        break
+                else:
+                    # Strict time constraint
+                    if new_estimated_time <= self.config.time_window_seconds:
+                        packed.append(parcel)
+                        current_size += parcel.size
+                        estimated_time = new_estimated_time
+                    else:
+                        break
+
+        return packed
 
     def _create_best_route(
         self,
@@ -2200,4 +2564,3 @@ class UpdatedALNSOperators:
                     break
 
         return new_solution
-
