@@ -435,6 +435,7 @@ class Solution:
         self.total_time_violation_penalty = 0.0
         self.routes_with_time_violations = 0
         self.constraint_violation_summary = {}
+        self._max_knock = None
 
     def _rebuild_assignments(self):
         """Rebuild pickup assignments after route modifications"""
